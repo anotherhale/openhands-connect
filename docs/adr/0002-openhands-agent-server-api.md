@@ -70,6 +70,13 @@ Mapping to the bridge's normalized `TaskState` lives in `STATE_MAP` in
 therefore reports `cancelled=False` and states the real effect. Claiming
 `cancelled=True` would assert a capability upstream does not have.
 
+**`deleting` maps to `UNKNOWN`, not `CANCELLED`.** Deletion is not cancellation:
+a conversation being torn down was not necessarily stopped by us, and upstream
+exposes no verified signal that says it was. Reporting `CANCELLED` would invent
+that signal, exactly as claiming `cancelled=True` would. The raw
+`provider_state` is preserved on the returned `Task`, so a caller that knows
+better can interpret it.
+
 ## Consequences
 
 - Upstream shapes are isolated in `adapters/openhands.py`; nothing else in the

@@ -16,7 +16,6 @@ from openhands_connect.adapters.openhands import OpenHandsAdapter
 from openhands_connect.audit import FileAuditSink, StreamAuditSink
 from openhands_connect.config import LoadedConfig, load_config
 from openhands_connect.domain.errors import ConfigurationError
-from openhands_connect.domain.models import Environment
 from openhands_connect.domain.registry import EnvironmentRegistry
 from openhands_connect.mcp_server.server import build_server
 from openhands_connect.policy import PolicyEngine
@@ -28,12 +27,9 @@ AUDIT_LOG_ENV_VAR = "OH_CONNECT_AUDIT_LOG"
 
 def build_service() -> ConnectService:
     config = load_config()
-    credential_values = tuple(
-        value for env in config.environments if (value := _credential(config, env))
-    )
-    redactor = Redactor(credential_values)
+    redactor = Redactor(_known_credentials(config))
     provider = OpenHandsAdapter(
-        lambda environment: _credential(config, environment), redactor=redactor
+        lambda environment: config.credential_for(environment), redactor=redactor
     )
     audit_path = os.environ.get(AUDIT_LOG_ENV_VAR)
     audit = FileAuditSink(audit_path) if audit_path else StreamAuditSink()
@@ -45,13 +41,23 @@ def build_service() -> ConnectService:
     )
 
 
-def _credential(config: LoadedConfig, environment: Environment) -> str | None:
-    try:
-        return config.credential_for(environment)
-    except ConfigurationError:
-        # A missing credential is reported when the environment is actually
-        # used, so listing environments still works with an incomplete setup.
-        return None
+def _known_credentials(config: LoadedConfig) -> tuple[str, ...]:
+    """Credentials available now, for the redactor's literal set.
+
+    Best effort: a credential that is configured but absent must not stop the
+    server from starting, because listing environments has to keep working.
+    The adapter resolves credentials strictly at call time and fails closed
+    there, so an operation on an unconfigured environment cannot proceed.
+    """
+    values: list[str] = []
+    for environment in config.environments:
+        try:
+            value = config.credential_for(environment)
+        except ConfigurationError:
+            continue
+        if value:
+            values.append(value)
+    return tuple(values)
 
 
 def main() -> None:

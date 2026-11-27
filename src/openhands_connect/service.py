@@ -12,7 +12,7 @@ from dataclasses import dataclass, field
 from typing import TypeVar
 
 from openhands_connect.audit import AuditSink, NullAuditSink
-from openhands_connect.domain.errors import PolicyDeniedError
+from openhands_connect.domain.errors import ConfigurationError, PolicyDeniedError
 from openhands_connect.domain.models import (
     AuditEvent,
     AuditOutcome,
@@ -156,6 +156,36 @@ class ConnectService:
                     # ProviderError messages are redacted at the adapter
                     # boundary, so this is safe to persist.
                     detail=exc.message,
+                )
+            )
+            raise
+        except ConfigurationError as exc:
+            # A configured-but-unusable environment is an operator fault, not an
+            # upstream failure. ConfigurationError messages are built only from
+            # config identifiers (env var names, file paths), never values, so
+            # the message is safe to record and is what an operator needs.
+            self.audit.record(
+                AuditEvent(
+                    environment_id=environment.id,
+                    operation=operation,
+                    outcome=AuditOutcome.FAILED,
+                    task_id=task_id,
+                    detail=exc.message,
+                )
+            )
+            raise
+        except Exception as exc:
+            # An unexpected failure must still leave an audit trail, or a failed
+            # operation silently disappears from it. Only the exception *type*
+            # is recorded: a message from an arbitrary exception may carry
+            # request data or a credential, and the audit store has no redactor.
+            self.audit.record(
+                AuditEvent(
+                    environment_id=environment.id,
+                    operation=operation,
+                    outcome=AuditOutcome.FAILED,
+                    task_id=task_id,
+                    detail=f"unexpected {type(exc).__name__}",
                 )
             )
             raise

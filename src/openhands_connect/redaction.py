@@ -63,6 +63,15 @@ class Redactor:
         # Longest first, so a secret that contains another is fully removed.
         self._literals = tuple(sorted((s for s in secrets if s), key=len, reverse=True))
 
+    def with_secrets(self, *secrets: str) -> Redactor:
+        """Return a redactor that also removes these literals.
+
+        Existing literals are kept, so a caller-supplied redactor can be
+        extended with a per-call credential without losing its configured
+        secret set.
+        """
+        return Redactor(self._literals + tuple(secrets))
+
     def redact(self, text: str) -> str:
         if not text:
             return text

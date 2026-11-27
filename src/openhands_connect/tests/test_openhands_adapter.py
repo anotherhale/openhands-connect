@@ -22,6 +22,7 @@ from openhands_connect.adapters.openhands import (
     OpenHandsAdapter,
     map_state,
 )
+from openhands_connect.domain.errors import ConfigurationError
 from openhands_connect.domain.models import (
     Environment,
     ProviderErrorKind,
@@ -62,7 +63,9 @@ def adapter_for(
         ("finished", TaskState.COMPLETED),
         ("error", TaskState.FAILED),
         ("stuck", TaskState.FAILED),
-        ("deleting", TaskState.CANCELLED),
+        # Deletion is not cancellation; upstream gives no verified signal that a
+        # deleted conversation was cancelled, so it must not read as CANCELLED.
+        ("deleting", TaskState.UNKNOWN),
     ],
 )
 def test_documented_upstream_states_map(upstream: str, expected: TaskState) -> None:
@@ -125,6 +128,49 @@ async def test_health_check_without_credential_sends_no_key_header(
 
     await adapter_for(handler, environment, credential=None).health_check(environment)
     assert API_KEY_HEADER.lower() not in seen
+
+
+async def test_missing_credential_fails_closed_before_sending(environment: Environment) -> None:
+    """A configured-but-absent credential must abort, not send anonymously."""
+    sent = False
+
+    def handler(_request: httpx.Request) -> httpx.Response:
+        nonlocal sent
+        sent = True
+        return httpx.Response(200, json={"version": "1.60.1"})
+
+    def provider(_env: Environment) -> str | None:
+        raise ConfigurationError(
+            "environment 'local' requires credential env var OH_TEST_API_KEY, which is not set"
+        )
+
+    adapter = OpenHandsAdapter(provider, transport=httpx.MockTransport(handler))
+    with pytest.raises(ConfigurationError):
+        await adapter.health_check(environment)
+    assert sent is False, "no request may be sent when the credential is missing"
+
+
+async def test_injected_redactor_secrets_survive_the_credential(
+    environment: Environment,
+) -> None:
+    """The adapter adds the credential to the injected set; it must not replace it."""
+    other_secret = "operator-configured-secret"
+    adapter = OpenHandsAdapter(
+        lambda _env: "session-token-value",
+        transport=httpx.MockTransport(
+            lambda _r: httpx.Response(
+                500, json={"detail": f"boom session-token-value and {other_secret}"}
+            )
+        ),
+        redactor=Redactor((other_secret,)),
+    )
+
+    with pytest.raises(ProviderUnavailable) as excinfo:
+        await adapter.get_task(environment, "task-1")
+
+    message = str(excinfo.value)
+    assert "session-token-value" not in message
+    assert other_secret not in message
 
 
 async def test_health_check_reports_rejected_credential(environment: Environment) -> None:

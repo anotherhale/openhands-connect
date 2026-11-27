@@ -86,6 +86,13 @@ def test_environment_without_credential_reference_needs_none(config_file) -> Non
     assert loaded.credential_for(loaded.environments[0]) is None
 
 
+def test_empty_credential_env_var_is_rejected(config_file) -> None:
+    """An empty name would silently mean 'no credential'; a typo must not do that."""
+    body = VALID_CONFIG.replace("credential_env_var: OH_LOCAL_KEY", 'credential_env_var: ""')
+    with pytest.raises(ConfigurationError, match="must not be empty"):
+        load_config(config_file(body), env={})
+
+
 def test_invalid_environment_id_is_rejected(config_file) -> None:
     body = VALID_CONFIG.replace("  - id: local", "  - id: Not Valid!")
     with pytest.raises(ConfigurationError, match="id"):

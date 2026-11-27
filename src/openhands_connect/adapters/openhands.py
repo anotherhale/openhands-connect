@@ -57,7 +57,10 @@ STATE_MAP: dict[str, TaskState] = {
     "finished": TaskState.COMPLETED,
     "error": TaskState.FAILED,
     "stuck": TaskState.FAILED,
-    "deleting": TaskState.CANCELLED,
+    # Deletion is not cancellation. Upstream gives no verified signal that a
+    # `deleting` conversation was cancelled, so it stays UNKNOWN; the raw
+    # provider_state is preserved on the Task for callers that need it.
+    "deleting": TaskState.UNKNOWN,
 }
 
 CredentialProvider = Callable[[Environment], "str | None"]
@@ -97,15 +100,15 @@ class OpenHandsAdapter:
     def _redactor_for(self, environment: Environment) -> Redactor:
         """A redactor that knows this environment's credential.
 
-        The credential is added as a literal so a token that matches no generic
-        pattern is still removed from anything returned to a caller. This is
+        The credential is composed onto the injected redactor's literal set
+        rather than replacing it, so configured secrets stay scrubbed. This is
         defence in depth: callers should also configure a redactor, but the
         adapter never relies on them having done so.
         """
         credential = self._credential_provider(environment)
         if not credential:
             return self._redactor
-        return Redactor((credential,))
+        return self._redactor.with_secrets(credential)
 
     async def health_check(self, environment: Environment) -> HealthStatus:
         try:

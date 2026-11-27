@@ -4,12 +4,17 @@ from __future__ import annotations
 
 import pytest
 
-from openhands_connect.domain.errors import PolicyDeniedError, UnknownEnvironmentError
+from openhands_connect.domain.errors import (
+    ConfigurationError,
+    PolicyDeniedError,
+    UnknownEnvironmentError,
+)
 from openhands_connect.domain.models import (
     READ_OPERATIONS,
     AuditOutcome,
     Operation,
     ProviderUnavailable,
+    Task,
     TaskRequest,
     TaskState,
 )
@@ -86,6 +91,63 @@ async def test_provider_failure_emits_failed_audit_and_reraises(
 
     assert audit.events[0].outcome is AuditOutcome.FAILED
     assert audit.events[0].task_id == "task-9"
+
+
+async def test_unexpected_failure_emits_failed_audit_without_exception_text(
+    environment, audit: RecordingAudit
+) -> None:
+    """An unexpected exception must be audited, but its message must not leak.
+
+    Only the exception type is recorded: an arbitrary message may carry request
+    data or a credential, and the audit store has no redactor.
+    """
+
+    class Boom(RuntimeError):
+        pass
+
+    provider = FailingProvider(fail_with=Boom("leaked-token-abc123 from the request body"))
+    service = ConnectService(
+        registry=EnvironmentRegistry((environment,)),
+        provider=provider,
+        policy=PolicyEngine(),
+        audit=audit,
+    )
+
+    with pytest.raises(Boom):
+        await service.get_task("local", "task-9")
+
+    assert len(audit.events) == 1
+    event = audit.events[0]
+    assert event.outcome is AuditOutcome.FAILED
+    assert event.task_id == "task-9"
+    assert event.detail == "unexpected Boom"
+    assert "leaked-token-abc123" not in event.model_dump_json()
+
+
+async def test_missing_credential_fault_is_audited_with_its_message(
+    environment, audit: RecordingAudit
+) -> None:
+    """An operator fault is recorded with the actionable message, not a generic one."""
+
+    class MissingKeyProvider(FakeProvider):
+        async def get_task(self, *_args: object, **_kwargs: object) -> Task:
+            raise ConfigurationError(
+                "environment 'local' requires credential env var OH_TEST_API_KEY, which is not set"
+            )
+
+    service = ConnectService(
+        registry=EnvironmentRegistry((environment,)),
+        provider=MissingKeyProvider(),
+        policy=PolicyEngine(),
+        audit=audit,
+    )
+
+    with pytest.raises(ConfigurationError):
+        await service.get_task("local", "task-9")
+
+    event = audit.events[0]
+    assert event.outcome is AuditOutcome.FAILED
+    assert "OH_TEST_API_KEY" in (event.detail or "")
 
 
 async def test_audit_event_has_no_payload_fields(

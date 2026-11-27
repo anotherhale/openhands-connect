@@ -123,6 +123,10 @@ class TaskRequest(Frozen):
     agent_profile_id: str | None = Field(default=None, max_length=128)
     #: Explicit agent settings, used only when no profile is available.
     #: Passed through to upstream unchanged.
+    #: Not exposed by the ``create_task`` MCP tool: the payload is arbitrary and
+    #: unvalidated, so accepting it from a caller would let an MCP client set
+    #: upstream agent configuration the policy engine cannot inspect. Set here by
+    #: a future server-side default, or wire it to the tool with validation first.
     agent_settings: dict[str, Any] | None = None
 
 

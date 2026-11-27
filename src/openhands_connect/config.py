@@ -55,6 +55,13 @@ class EnvironmentConfig(_ConfigModel):
     def _validate_env_var_name(cls, value: str | None) -> str | None:
         if value is None:
             return None
+        # An empty name would silently mean "no credential"; reject it so a
+        # typo cannot turn an authenticated environment into an anonymous one.
+        if not value:
+            raise ValueError(
+                "credential_env_var must not be empty; omit it for an "
+                "environment that needs no credential"
+            )
         if not value.replace("_", "").isalnum() or value[0].isdigit():
             raise ValueError(
                 "credential_env_var must be an environment variable name, not a credential value"
