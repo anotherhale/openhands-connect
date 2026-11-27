@@ -33,3 +33,7 @@ venv/
 .vscode/
 .DS_Store
 Thumbs.db
+
+# Local environment configuration (copy from examples/, contains real hostnames)
+config/*.yaml
+!config/.gitkeep
