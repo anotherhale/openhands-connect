@@ -30,7 +30,8 @@ names a credential variable.
 
 | Method | Path | Purpose |
 |---|---|---|
-| GET | `/server_info` | health check; unauthenticated, returns `version` |
+| GET | `/server_info` | health check; **unauthenticated**, returns `version` |
+| GET | `/api/conversations/count` | credential probe for health (see below) |
 | GET | `/api/agent-profiles` | resolve a profile **name** to its UUID |
 | POST | `/api/conversations` | create a task (conversation) |
 | GET | `/api/conversations/{id}` | task status |
@@ -38,6 +39,25 @@ names a credential variable.
 | GET | `/api/conversations/{id}/agent_final_response` | task result |
 | POST | `/api/conversations/{id}/events` | follow-up message |
 | POST | `/api/conversations/{id}/interrupt` | stop (see limitations) |
+
+### The health check must make two requests
+
+`/server_info` answers `200` with the version **even when the credential is
+wrong** — it does not enforce auth. A health check that stops there reports a
+broken token as healthy, which is what happened before this was found. When an
+environment configures a credential, the adapter therefore follows up with an
+authenticated route (`GET /api/conversations/count`, which returns `401` for a
+bad key) and reports `reachable=false` when it is rejected. With no credential
+configured, only `/server_info` is asked, so an anonymous server is not called
+broken.
+
+### `events/search` caps `limit` at 100
+
+A `limit` above `100` fails with `422` ("Input should be less than or equal to
+100"). The bridge bounds to 100 and advertises that maximum in the tool schema.
+The route sorts `TIMESTAMP` (oldest first) by default and pages forward with
+`next_page_id`; the bridge does not page, so a long run's logs are its opening
+events.
 
 ## Creating a conversation
 

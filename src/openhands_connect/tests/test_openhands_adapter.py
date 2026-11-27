@@ -11,13 +11,14 @@ Every payload shape here was captured from a live OpenHands Agent Server 1.60.1.
 from __future__ import annotations
 
 import json
-from collections.abc import Callable
+from collections.abc import Awaitable, Callable
 
 import httpx
 import pytest
 
 from openhands_connect.adapters.openhands import (
     API_KEY_HEADER,
+    MAX_LOG_ENTRIES,
     STATE_MAP,
     OpenHandsAdapter,
     map_state,
@@ -25,13 +26,16 @@ from openhands_connect.adapters.openhands import (
 from openhands_connect.domain.errors import ConfigurationError
 from openhands_connect.domain.models import (
     Environment,
+    ProviderError,
     ProviderErrorKind,
     ProviderInvalidRequest,
     ProviderNotFound,
     ProviderProtocolError,
     ProviderRateLimited,
+    ProviderTimeout,
     ProviderUnauthorized,
     ProviderUnavailable,
+    TaskRequest,
     TaskState,
 )
 from openhands_connect.redaction import Redactor
@@ -97,8 +101,11 @@ def test_state_map_covers_every_documented_status() -> None:
 
 async def test_health_check_reports_version(environment: Environment) -> None:
     def handler(request: httpx.Request) -> httpx.Response:
-        assert request.url.path == "/server_info"
-        return httpx.Response(200, json={"version": "1.60.1", "title": "OpenHands Agent Server"})
+        if request.url.path == "/server_info":
+            return httpx.Response(
+                200, json={"version": "1.60.1", "title": "OpenHands Agent Server"}
+            )
+        return httpx.Response(200, json=7)
 
     health = await adapter_for(handler, environment).health_check(environment)
 
@@ -111,7 +118,9 @@ async def test_health_check_sends_the_session_api_key_header(environment: Enviro
 
     def handler(request: httpx.Request) -> httpx.Response:
         seen.update(dict(request.headers))
-        return httpx.Response(200, json={"version": "1.60.1"})
+        if request.url.path == "/server_info":
+            return httpx.Response(200, json={"version": "1.60.1"})
+        return httpx.Response(200, json=1)
 
     await adapter_for(handler, environment).health_check(environment)
     assert seen[API_KEY_HEADER.lower()] == "secret-token"
@@ -174,10 +183,16 @@ async def test_injected_redactor_secrets_survive_the_credential(
 
 
 async def test_health_check_reports_rejected_credential(environment: Environment) -> None:
-    handler: Handler = lambda _request: httpx.Response(401, json={"detail": "Unauthorized"})
+    """A 401 on the authenticated probe means the target is not usable."""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/server_info":
+            return httpx.Response(200, json={"version": "1.60.1"})
+        return httpx.Response(401, json={"detail": "Unauthorized"})
+
     health = await adapter_for(handler, environment).health_check(environment)
 
-    assert health.reachable is True
+    assert health.reachable is False
     assert "credential" in health.detail
 
 
@@ -538,7 +553,26 @@ async def test_logs_request_bounds_limit(environment: Environment) -> None:
         return httpx.Response(200, json={"items": [], "next_page_id": None})
 
     await adapter_for(handler, environment).get_task_logs(environment, "t1", limit=5000)
-    assert captured["limit"] == "200"
+    assert captured["limit"] == "100"
+
+
+async def test_logs_limit_matches_the_upstream_maximum(environment: Environment) -> None:
+    """``events/search`` rejects ``limit`` above 100 with a 422.
+
+    Verified against Agent Server 1.60.1: ``limit=200`` fails with
+    ``Input should be less than or equal to 100``. The tool schema advertised
+    1-200, so the largest value a caller could ask for was always an error.
+    """
+    assert MAX_LOG_ENTRIES == 100
+
+    captured: dict[str, str] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured.update(dict(request.url.params))
+        return httpx.Response(200, json={"items": [], "next_page_id": None})
+
+    await adapter_for(handler, environment).get_task_logs(environment, "t1", limit=MAX_LOG_ENTRIES)
+    assert captured["limit"] == "100"
 
 
 async def test_logs_truncate_long_event_text(environment: Environment) -> None:
@@ -683,13 +717,21 @@ async def test_adapter_uses_the_environment_base_url() -> None:
 
     def handler(request: httpx.Request) -> httpx.Response:
         seen.append(f"{request.url.host}:{request.url.port}")
-        return httpx.Response(200, json={"version": "1.60.1"})
+        if request.url.path == "/server_info":
+            return httpx.Response(200, json={"version": "1.60.1"})
+        return httpx.Response(200, json=1)
 
     adapter = adapter_for(handler, first)
     await adapter.health_check(first)
     await adapter.health_check(second)
 
-    assert seen == ["127.0.0.1:18000", "127.0.0.1:19000"]
+    # Each health check makes two calls: /server_info, then the credential probe.
+    assert seen == [
+        "127.0.0.1:18000",
+        "127.0.0.1:18000",
+        "127.0.0.1:19000",
+        "127.0.0.1:19000",
+    ]
 
 
 async def test_timeout_is_reported_as_unreachable(environment: Environment) -> None:
@@ -699,3 +741,150 @@ async def test_timeout_is_reported_as_unreachable(environment: Environment) -> N
     health = await adapter_for(handler, environment).health_check(environment)
     assert health.reachable is False
     assert "timed out" in health.detail
+
+
+# -- health must actually verify the credential -----------------------------
+
+
+async def test_health_check_reports_a_rejected_credential_as_unreachable(
+    environment: Environment,
+) -> None:
+    """A server that rejects the token is not a usable target.
+
+    Verified against Agent Server 1.60.1: ``GET /server_info`` answers 200 even
+    with a wrong key (it is unauthenticated), so a health check that stops there
+    reports a broken credential as healthy.
+    """
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/server_info":
+            return httpx.Response(200, json={"version": "1.60.1"})
+        return httpx.Response(401, json={"detail": "Unauthorized"})
+
+    health = await adapter_for(handler, environment).health_check(environment)
+
+    assert health.reachable is False
+    assert health.server_version is None
+    assert "credential" in health.detail
+    assert "secret-token" not in health.detail
+
+
+async def test_health_check_probes_an_authenticated_endpoint(
+    environment: Environment,
+) -> None:
+    """The credential is only checked by a route that requires it."""
+    paths: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        paths.append(request.url.path)
+        if request.url.path == "/server_info":
+            return httpx.Response(200, json={"version": "1.60.1"})
+        return httpx.Response(200, json=3)
+
+    health = await adapter_for(handler, environment).health_check(environment)
+
+    assert health.reachable is True
+    assert health.server_version == "1.60.1"
+    assert "/api/conversations/count" in paths
+
+
+async def test_health_check_skips_the_credential_probe_when_none_is_configured(
+    environment: Environment,
+) -> None:
+    """An unauthenticated server must not be reported as broken."""
+    paths: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        paths.append(request.url.path)
+        if request.url.path == "/server_info":
+            return httpx.Response(200, json={"version": "1.60.1"})
+        return httpx.Response(401, json={"detail": "Unauthorized"})
+
+    health = await adapter_for(handler, environment, credential=None).health_check(environment)
+
+    assert health.reachable is True
+    assert paths == ["/server_info"]
+
+
+async def test_health_check_reports_a_broken_credential_probe_as_unreachable(
+    environment: Environment,
+) -> None:
+    """A 5xx on the authenticated probe is a real failure, not a health pass."""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/server_info":
+            return httpx.Response(200, json={"version": "1.60.1"})
+        return httpx.Response(503, json={"detail": "not ready"})
+
+    health = await adapter_for(handler, environment).health_check(environment)
+
+    assert health.reachable is False
+    assert health.server_version is None
+
+
+# -- transport failures must not escape as raw httpx exceptions --------------
+
+
+@pytest.mark.parametrize(
+    "operation",
+    ["get_task", "get_task_logs", "get_task_result", "send_message", "stop_task", "create_task"],
+)
+async def test_transport_failure_never_escapes_as_an_httpx_error(
+    environment: Environment, operation: str
+) -> None:
+    """A refused connection or a timeout must map into the provider taxonomy.
+
+    An escaping ``httpx.ConnectError`` is not a ``ProviderError``, so the tool
+    layer can only answer ``internal_error`` — the caller loses both the cause
+    and the ``retryable`` hint.
+    """
+
+    def handler(_request: httpx.Request) -> httpx.Response:
+        raise httpx.ConnectError("connection refused")
+
+    adapter = adapter_for(handler, environment)
+    calls: dict[str, Callable[[], Awaitable[object]]] = {
+        "get_task": lambda: adapter.get_task(environment, "t1"),
+        "get_task_logs": lambda: adapter.get_task_logs(environment, "t1"),
+        "get_task_result": lambda: adapter.get_task_result(environment, "t1"),
+        "send_message": lambda: adapter.send_message(environment, "t1", "hi"),
+        "stop_task": lambda: adapter.stop_task(environment, "t1"),
+        "create_task": lambda: adapter.create_task(environment, TaskRequest(prompt="hi")),
+    }
+
+    with pytest.raises(ProviderError) as excinfo:
+        await calls[operation]()
+
+    assert not isinstance(excinfo.value, ProviderProtocolError)
+    assert "connection refused" not in str(excinfo.value)
+    assert "secret-token" not in str(excinfo.value)
+
+
+@pytest.mark.parametrize(
+    ("error", "expected"),
+    [
+        (httpx.ConnectError("refused"), ProviderUnavailable),
+        (httpx.ReadTimeout("slow"), ProviderTimeout),
+        (httpx.ConnectTimeout("slow"), ProviderTimeout),
+    ],
+)
+async def test_transport_errors_map_to_the_right_provider_error(
+    environment: Environment, error: Exception, expected: type[Exception]
+) -> None:
+    def handler(_request: httpx.Request) -> httpx.Response:
+        raise error
+
+    with pytest.raises(expected) as excinfo:
+        await adapter_for(handler, environment).get_task(environment, "t1")
+    assert getattr(excinfo.value, "retryable", False) is True
+
+
+async def test_transport_failure_detail_does_not_leak_the_credential(
+    environment: Environment,
+) -> None:
+    def handler(_request: httpx.Request) -> httpx.Response:
+        raise httpx.ConnectError("could not reach host while using secret-token")
+
+    with pytest.raises(ProviderUnavailable) as excinfo:
+        await adapter_for(handler, environment).get_task(environment, "t1")
+    assert "secret-token" not in str(excinfo.value)

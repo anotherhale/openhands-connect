@@ -74,6 +74,8 @@ async def test_stop_task_description_states_the_limitation(server) -> None:
     description = by_name["stop_task"].description.lower()
     assert "no" in description and "terminate" in description
     assert "paused" in description
+    # Interruption pauses the run; it must not read as a permanent kill.
+    assert "resume" in description or "resumable" in description
 
 
 async def test_list_environments_returns_sanitized_metadata(server) -> None:
@@ -226,6 +228,55 @@ async def test_logs_are_returned_with_truncation_flags(server, fake_provider) ->
     assert len(body["entries"]) == 4
     assert body["truncated"] is True
     assert body["dropped_entries"] == 6
+
+
+async def test_log_limit_schema_matches_the_upstream_maximum(server) -> None:
+    """The advertised maximum must be one the server accepts.
+
+    Upstream ``events/search`` caps ``limit`` at 100 (422 above it), so a schema
+    offering 200 let a caller request a value that could only fail.
+    """
+    by_name = {tool.name: tool for tool in await server.list_tools()}
+    limit_schema = by_name["get_task_logs"].input_schema["properties"]["limit"]
+
+    assert limit_schema["maximum"] == 100
+    assert "1-100" in limit_schema["description"]
+    # The tool layer keeps its own copy to stay free of upstream details; the
+    # two bounds must not drift.
+    from openhands_connect.adapters.openhands import MAX_LOG_ENTRIES as ADAPTER_MAX
+
+    assert limit_schema["maximum"] == ADAPTER_MAX
+
+
+async def test_unreachable_server_is_reported_as_a_provider_failure() -> None:
+    """A refused connection must not surface as ``internal_error``.
+
+    ``error_payload`` only recognizes ``ProviderError``; a raw ``httpx`` error
+    escaping the adapter fell through to ``internal_error``, which told a caller
+    nothing about the cause and offered no retry hint.
+    """
+    import httpx
+
+    environment = make_environment()
+
+    def handler(_request: httpx.Request) -> httpx.Response:
+        raise httpx.ConnectError("connection refused")
+
+    server = build_server(
+        ConnectService(
+            registry=EnvironmentRegistry((environment,)),
+            provider=OpenHandsAdapter(lambda _env: None, transport=httpx.MockTransport(handler)),
+            policy=PolicyEngine(),
+        )
+    )
+
+    body = payload(
+        await server.call_tool("create_task", {"environment_id": "local", "prompt": "x"})
+    )
+
+    assert body["error"] == "provider_unavailable"
+    assert body["retryable"] is True
+    assert "internal_error" not in json.dumps(body)
 
 
 async def test_no_credential_appears_in_any_tool_output(environment, audit) -> None:

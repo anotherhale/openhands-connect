@@ -13,7 +13,8 @@ from __future__ import annotations
 
 import logging
 import re
-from collections.abc import Callable
+from collections.abc import AsyncIterator, Callable
+from contextlib import asynccontextmanager
 from datetime import datetime
 from typing import Any
 
@@ -28,6 +29,7 @@ from openhands_connect.domain.models import (
     ProviderNotFound,
     ProviderProtocolError,
     ProviderRateLimited,
+    ProviderTimeout,
     ProviderUnauthorized,
     ProviderUnavailable,
     StopResult,
@@ -45,7 +47,12 @@ logger = logging.getLogger(__name__)
 
 API_KEY_HEADER = "X-Session-API-Key"
 MAX_LOG_TEXT_CHARS = 2_000
-MAX_LOG_ENTRIES = 200
+#: ``events/search`` rejects ``limit`` above 100 with a 422 (verified on
+#: Agent Server 1.60.1: "Input should be less than or equal to 100").
+MAX_LOG_ENTRIES = 100
+#: An authenticated route used to prove the credential is accepted.
+#: ``/server_info`` is unauthenticated and answers 200 even for a bad token.
+CREDENTIAL_PROBE_PATH = "/api/conversations/count"
 
 #: Upstream ``execution_status`` -> bridge state. Verified against
 #: ``ConversationExecutionStatus`` in the server OpenAPI document.
@@ -111,16 +118,32 @@ class OpenHandsAdapter:
         return self._redactor.with_secrets(credential)
 
     async def health_check(self, environment: Environment) -> HealthStatus:
+        """Report reachability *and* whether the credential is accepted.
+
+        ``/server_info`` is unauthenticated: it answers 200 with the version even
+        for a wrong key. A health check that stopped there reported a broken
+        credential as healthy, so when a credential is configured a second,
+        authenticated request confirms it. Without one, the server is expected to
+        accept anonymous calls and only ``/server_info`` is asked.
+        """
+        credential = self._credential_provider(environment)
         try:
-            async with self._client(environment) as client:
+            async with self._calling(environment) as client:
                 response = await client.get("/server_info")
-                if response.status_code in (401, 403):
-                    return HealthStatus(
-                        reachable=True,
-                        detail="server reachable but rejected the credential",
-                    )
                 self._raise_for_status(response, environment)
                 payload = _json_object(response, environment)
+
+                if credential:
+                    probe = await client.get(CREDENTIAL_PROBE_PATH)
+                    if probe.status_code in (401, 403):
+                        return HealthStatus(
+                            reachable=False,
+                            detail=(
+                                "server reachable but rejected the credential; "
+                                "check the value of the configured credential env var"
+                            ),
+                        )
+                    self._raise_for_status(probe, environment)
         except ProviderError as exc:
             return HealthStatus(reachable=False, detail=exc.message)
         except httpx.HTTPError as exc:
@@ -164,7 +187,7 @@ class OpenHandsAdapter:
                 "The OpenHands Agent Server rejects a conversation with none of them."
             )
 
-        async with self._client(environment) as client:
+        async with self._calling(environment) as client:
             if profile and not _looks_like_uuid(profile):
                 payload["agent_profile_id"] = await self._resolve_profile_id(
                     client, environment, profile
@@ -206,7 +229,7 @@ class OpenHandsAdapter:
         )
 
     async def get_task(self, environment: Environment, task_id: TaskId) -> Task:
-        async with self._client(environment) as client:
+        async with self._calling(environment) as client:
             response = await client.get(f"/api/conversations/{task_id}")
             self._raise_for_status(response, environment)
             body = _json_object(response, environment)
@@ -216,7 +239,7 @@ class OpenHandsAdapter:
         self, environment: Environment, task_id: TaskId, *, limit: int = 50
     ) -> TaskLogs:
         bounded = max(1, min(limit, MAX_LOG_ENTRIES))
-        async with self._client(environment) as client:
+        async with self._calling(environment) as client:
             response = await client.get(
                 f"/api/conversations/{task_id}/events/search",
                 params={"limit": bounded, "sort_order": "TIMESTAMP"},
@@ -242,7 +265,7 @@ class OpenHandsAdapter:
         )
 
     async def get_task_result(self, environment: Environment, task_id: TaskId) -> TaskResult:
-        async with self._client(environment) as client:
+        async with self._calling(environment) as client:
             task_response = await client.get(f"/api/conversations/{task_id}")
             self._raise_for_status(task_response, environment)
             task = _task_from_payload(_json_object(task_response, environment), environment)
@@ -278,7 +301,7 @@ class OpenHandsAdapter:
         )
 
     async def send_message(self, environment: Environment, task_id: TaskId, message: str) -> None:
-        async with self._client(environment) as client:
+        async with self._calling(environment) as client:
             response = await client.post(
                 f"/api/conversations/{task_id}/events",
                 json={
@@ -297,7 +320,7 @@ class OpenHandsAdapter:
         ``cancelled=True`` would claim something upstream cannot do, so the
         result keeps ``cancelled=False`` and states the real effect.
         """
-        async with self._client(environment) as client:
+        async with self._calling(environment) as client:
             response = await client.post(f"/api/conversations/{task_id}/interrupt")
             self._raise_for_status(response, environment)
             status_response = await client.get(f"/api/conversations/{task_id}")
@@ -330,6 +353,21 @@ class OpenHandsAdapter:
             transport=self._transport,
             follow_redirects=False,
         )
+
+    @asynccontextmanager
+    async def _calling(self, environment: Environment) -> AsyncIterator[httpx.AsyncClient]:
+        """Open a client and translate transport failures into provider errors.
+
+        ``httpx`` errors are not ``ProviderError``, so letting one escape makes
+        the tool layer answer ``internal_error``: the caller loses both the cause
+        and the retry hint. A refused connection or a timeout is an upstream
+        availability problem and is reported as one.
+        """
+        try:
+            async with self._client(environment) as client:
+                yield client
+        except httpx.HTTPError as exc:
+            raise _transport_error(exc, environment, self._redactor_for(environment)) from None
 
     def _raise_for_status(self, response: httpx.Response, environment: Environment) -> None:
         if response.is_success:
@@ -532,4 +570,26 @@ def _transport_detail(exc: httpx.HTTPError) -> str:
     return f"connection failed: {type(exc).__name__}"
 
 
-__all__ = ["API_KEY_HEADER", "STATE_MAP", "OpenHandsAdapter", "map_state"]
+def _transport_error(
+    exc: httpx.HTTPError, environment: Environment, redactor: Redactor
+) -> ProviderError:
+    """Map a transport failure onto the provider taxonomy.
+
+    Only the exception *type* and a fixed phrase reach the message: the original
+    ``httpx`` text can name the host, a URL, or a header value.
+    """
+    detail = redactor.redact(_transport_detail(exc))
+    target = environment.id
+    if isinstance(exc, httpx.TimeoutException):
+        return ProviderTimeout(f"environment {target!r} did not respond in time: {detail}")
+    return ProviderUnavailable(f"environment {target!r} is unreachable: {detail}")
+
+
+__all__ = [
+    "API_KEY_HEADER",
+    "CREDENTIAL_PROBE_PATH",
+    "MAX_LOG_ENTRIES",
+    "STATE_MAP",
+    "OpenHandsAdapter",
+    "map_state",
+]

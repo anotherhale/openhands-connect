@@ -133,8 +133,9 @@ def build_server(service: ConnectService) -> MCPServer:
         description=(
             "Request that a task stop. LIMITATION: OpenHands Agent Server has no "
             "endpoint that terminates a run, so this interrupts the task and leaves "
-            "it paused. The response reports cancelled=false and the resulting "
-            "state rather than claiming the task was cancelled."
+            "it paused. The conversation stays resumable: send_task_message on the "
+            "paused task continues it. The response reports cancelled=false and the "
+            "resulting state rather than claiming the task was cancelled."
         ),
     )
     async def stop_task(environment_id: EnvironmentIdArg, task_id: TaskIdArg) -> dict[str, Any]:

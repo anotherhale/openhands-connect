@@ -33,7 +33,11 @@ from openhands_connect.service import ConnectService
 
 MAX_PROMPT_CHARS = 20_000
 MAX_MESSAGE_CHARS = 8_000
-MAX_LOG_ENTRIES = 200
+#: Upstream rejects ``limit`` above 100 with a 422, so a schema offering more
+#: would advertise a value that can only fail. A test keeps this in step with
+#: the adapter's bound rather than importing it, which would pull an upstream
+#: detail into this layer.
+MAX_LOG_ENTRIES = 100
 
 EnvironmentIdArg = Annotated[
     str,
