@@ -2,11 +2,13 @@
 
 from __future__ import annotations
 
+from collections.abc import Iterator
 from pathlib import Path
 from typing import Any
 
 import pytest
 
+from openhands_connect.adapters import openhands as adapter_module
 from openhands_connect.audit import AuditSink
 from openhands_connect.domain.models import (
     EXECUTION_OPERATIONS,
@@ -20,6 +22,20 @@ from openhands_connect.domain.registry import EnvironmentRegistry
 from openhands_connect.policy import PolicyEngine
 from openhands_connect.service import ConnectService
 from openhands_connect.tests.fakes import FakeProvider
+
+
+@pytest.fixture(autouse=True)
+def _no_retry_sleep(monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
+    """Keep retry backoff out of the test clock.
+
+    The adapter sleeps between attempts; a test that exercises retries would
+    otherwise pay the real delay. Zeroing the two delay constants keeps the
+    real retry code path (attempt counts, which statuses retry) intact while
+    removing only the wait.
+    """
+    monkeypatch.setattr(adapter_module, "RETRY_BASE_DELAY_SECONDS", 0.0)
+    monkeypatch.setattr(adapter_module, "RETRY_MAX_DELAY_SECONDS", 0.0)
+    yield
 
 
 class RecordingAudit(AuditSink):

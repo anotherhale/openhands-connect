@@ -97,6 +97,10 @@ class Environment(Frozen):
     allowed_operations: frozenset[Operation] = Field(default_factory=frozenset)
     credential_env_var: str | None = Field(default=None, max_length=128)
     request_timeout_seconds: float = Field(default=30.0, gt=0, le=600)
+    #: Upper bound on attempts for a *retryable* call (1 disables retries).
+    #: Retries are only ever spent on reads and on writes proven idempotent, so
+    #: this cannot duplicate a task or a message.
+    max_attempts: int = Field(default=3, ge=1, le=10)
     default_agent_profile_id: str | None = Field(default=None, max_length=128)
 
     @field_validator("base_url")
@@ -131,6 +135,11 @@ class HealthStatus(Frozen):
     detail: str
     server_version: str | None = None
     credential_state: CredentialState = CredentialState.NOT_CONFIGURED
+    #: ``/ready`` answers 200 only after initialization and 503 while starting.
+    #: Kept separate from ``reachable`` so a server that is up but still
+    #: initializing is not reported as ready to accept work. ``None`` when the
+    #: readiness probe could not be run (older server without ``/ready``).
+    ready: bool | None = None
     checked_at: datetime = Field(default_factory=lambda: datetime.now(UTC))
 
 
@@ -198,6 +207,25 @@ class StopResult(Frozen):
     detail: str
 
 
+class MessageDelivery(Frozen):
+    """What actually happened to a follow-up message.
+
+    A message write and the run that consumes it are two upstream operations.
+    The message can be stored while the run that would act on it is refused
+    (429 when the server's run capacity is full), so the two outcomes are
+    reported separately instead of collapsing into one "sent" flag.
+    """
+
+    task_id: TaskId
+    environment_id: EnvironmentId
+    #: Upstream stored the message. A rejected save never produces a result.
+    saved: bool
+    #: Upstream accepted the request to run. ``None`` when the run could not be
+    #: started *and* could not be shown not to have started.
+    started: bool | None
+    detail: str
+
+
 class ProviderErrorKind(StrEnum):
     UNAUTHORIZED = "unauthorized"
     NOT_FOUND = "not_found"
@@ -207,6 +235,10 @@ class ProviderErrorKind(StrEnum):
     TIMEOUT = "timeout"
     PROTOCOL = "protocol"
     UNSUPPORTED = "unsupported"
+    #: A mutating call whose outcome is genuinely undetermined: the request may
+    #: or may not have been applied. Never reported as success, and a retry by
+    #: the caller could duplicate the effect.
+    AMBIGUOUS = "ambiguous"
 
 
 class ProviderError(Exception):
@@ -272,6 +304,24 @@ class ProviderUnsupported(ProviderError):
     """
 
     kind = ProviderErrorKind.UNSUPPORTED
+
+
+class ProviderAmbiguousWrite(ProviderError):
+    """A mutating request whose effect upstream may or may not have applied.
+
+    Raised instead of a plain timeout/unavailable error when a write fails in a
+    way that leaves the outcome undetermined (a timeout, a reset connection, or
+    a 5xx *after* the request was sent). Neither success nor failure can be
+    claimed, so ``retryable`` is False: blindly retrying could duplicate the
+    write. When the caller can supply a stable id the effect is keyed on
+    (``task_id``), it is carried here so a caller can check before retrying.
+    """
+
+    kind = ProviderErrorKind.AMBIGUOUS
+
+    def __init__(self, message: str, *, task_id: str | None = None) -> None:
+        super().__init__(message, retryable=False)
+        self.task_id = task_id
 
 
 class PolicyDecision(Frozen):

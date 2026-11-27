@@ -19,6 +19,7 @@ from openhands_connect.domain.models import (
     READ_OPERATIONS,
     CredentialState,
     Environment,
+    ProviderAmbiguousWrite,
     ProviderUnavailable,
     TaskLogEntry,
 )
@@ -184,6 +185,28 @@ async def test_provider_failure_is_shaped_without_a_traceback(environment) -> No
     assert "Traceback" not in json.dumps(body)
 
 
+async def test_ambiguous_write_is_reported_as_not_retryable(environment) -> None:
+    """A write whose effect is unknown must not invite a blind retry."""
+    server = build_server(
+        ConnectService(
+            registry=EnvironmentRegistry((environment,)),
+            provider=FakeProvider(
+                fail_with=ProviderAmbiguousWrite("may or may not have been applied")
+            ),
+            policy=PolicyEngine(),
+        )
+    )
+
+    result = await server.call_tool(
+        "send_task_message",
+        {"environment_id": "local", "task_id": "t1", "message": "hi"},
+    )
+    body = payload(result)
+
+    assert body["error"] == "provider_ambiguous"
+    assert body["retryable"] is False
+
+
 async def test_stop_task_reports_that_it_was_not_cancelled(server) -> None:
     result = await server.call_tool("stop_task", {"environment_id": "local", "task_id": "t1"})
     body = payload(result)
@@ -211,7 +234,31 @@ async def test_send_task_message_reports_delivery(server, fake_provider) -> None
     body = payload(result)
 
     assert body["sent"] is True
+    assert body["saved"] is True
+    assert body["started"] is True
     assert fake_provider.sent_messages == [("t1", "also update the docs")]
+
+
+async def test_send_task_message_reports_a_stored_but_unstarted_message(
+    server, fake_provider
+) -> None:
+    """A message whose run was refused must not read as delivered.
+
+    ``sent`` means "the run will act on it"; a stored message whose run was
+    refused by the server (429 run capacity) is saved but not sent.
+    """
+    fake_provider.message_started = False
+
+    result = await server.call_tool(
+        "send_task_message",
+        {"environment_id": "local", "task_id": "t1", "message": "hi"},
+    )
+    body = payload(result)
+
+    assert body["saved"] is True
+    assert body["started"] is False
+    assert body["sent"] is False
+    assert "capacity" in body["detail"] or "did not start" in body["detail"]
 
 
 async def test_logs_are_returned_with_truncation_flags(server, fake_provider) -> None:

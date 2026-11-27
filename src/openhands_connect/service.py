@@ -19,6 +19,7 @@ from openhands_connect.domain.models import (
     Environment,
     EnvironmentId,
     HealthStatus,
+    MessageDelivery,
     Operation,
     ProviderError,
     StopResult,
@@ -101,9 +102,9 @@ class ConnectService:
 
     async def send_task_message(
         self, environment_id: EnvironmentId, task_id: TaskId, message: str
-    ) -> None:
+    ) -> MessageDelivery:
         environment = self._authorize(environment_id, Operation.SEND_TASK_MESSAGE)
-        await self._run(
+        return await self._run(
             environment,
             Operation.SEND_TASK_MESSAGE,
             lambda: self.provider.send_message(environment, task_id, message),

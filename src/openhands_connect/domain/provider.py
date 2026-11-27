@@ -11,6 +11,7 @@ from typing import Protocol, runtime_checkable
 from openhands_connect.domain.models import (
     Environment,
     HealthStatus,
+    MessageDelivery,
     StopResult,
     Task,
     TaskId,
@@ -36,7 +37,7 @@ class AgentExecutionProvider(Protocol):
 
     async def send_message(
         self, environment: Environment, task_id: TaskId, message: str
-    ) -> None: ...
+    ) -> MessageDelivery: ...
 
     async def stop_task(self, environment: Environment, task_id: TaskId) -> StopResult: ...
 

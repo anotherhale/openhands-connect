@@ -12,6 +12,7 @@ from openhands_connect.domain.models import (
     CredentialState,
     Environment,
     HealthStatus,
+    MessageDelivery,
     ProviderNotFound,
     ProviderUnavailable,
     StopResult,
@@ -40,6 +41,7 @@ class FakeProvider:
     task_title: str = "fake task"
     task_detail: str | None = None
     log_entries: tuple[TaskLogEntry, ...] = ()
+    message_started: bool | None = True
     fail_with: Exception | None = None
     calls: list[tuple[str, str]] = field(default_factory=list)
     created_requests: list[TaskRequest] = field(default_factory=list)
@@ -103,9 +105,22 @@ class FakeProvider:
             detail=None if self.result_available else "not available",
         )
 
-    async def send_message(self, environment: Environment, task_id: TaskId, message: str) -> None:
+    async def send_message(
+        self, environment: Environment, task_id: TaskId, message: str
+    ) -> MessageDelivery:
         self._record("send_message", environment)
         self.sent_messages.append((task_id, message))
+        return MessageDelivery(
+            task_id=task_id,
+            environment_id=environment.id,
+            saved=True,
+            started=self.message_started,
+            detail=(
+                "fake delivery: message saved and the run started"
+                if self.message_started
+                else "fake delivery: message saved but the run did not start"
+            ),
+        )
 
     async def stop_task(self, environment: Environment, task_id: TaskId) -> StopResult:
         self._record("stop_task", environment)

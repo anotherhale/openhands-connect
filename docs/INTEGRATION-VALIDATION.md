@@ -236,7 +236,9 @@ health check cannot pass on an unverified credential.
 | `reachable: false`, `credential_state: "unknown"` | The server is up but the credential probe could not complete (5xx, 429, or timeout). This is a *server* problem, not a bad token — do not rotate the credential yet. |
 | `provider_unavailable` … "unreachable" | Nothing is listening on `base_url`. Start the Agent Server or fix the URL. |
 | `provider_timeout` | The server is slow or wedged. Raise `request_timeout_seconds`, or investigate the server. |
-| `provider_invalid_request` … "valid UUID" | Task IDs are UUIDs. A non-UUID string is rejected by the server. |
+| `provider_invalid_request` … "valid UUID" | Task IDs are UUIDs. A non-UUID string is reported as an invalid-input error; a well-formed unknown id is `provider_not_found`. |
+| `provider_ambiguous_write` … "may or may not have been applied" | A mutating request (message save) failed after it may have reached the server. It is **not** retryable — check the named task before retrying, or the message may be duplicated. |
+| `reachable: true`, `ready: false` | The server is up but still initializing. Retry shortly; it is not ready to accept work yet. |
 | `provider_not_found` | The task ID does not exist on that environment (or was deleted). |
 | `unknown_environment` | The `environment_id` is not in the config; the error lists the valid ones. |
 | `check_environment` says `reachable: true` but calls fail with 401 | Should not happen after the fix; if it does, the credential probe route changed upstream. |
