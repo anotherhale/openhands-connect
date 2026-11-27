@@ -22,6 +22,7 @@ import httpx
 
 from openhands_connect.domain.errors import InvalidInputError
 from openhands_connect.domain.models import (
+    CredentialState,
     Environment,
     HealthStatus,
     ProviderError,
@@ -121,10 +122,15 @@ class OpenHandsAdapter:
         """Report reachability *and* whether the credential is accepted.
 
         ``/server_info`` is unauthenticated: it answers 200 with the version even
-        for a wrong key. A health check that stopped there reported a broken
-        credential as healthy, so when a credential is configured a second,
-        authenticated request confirms it. Without one, the server is expected to
-        accept anonymous calls and only ``/server_info`` is asked.
+        for a wrong key, so it alone cannot tell a working token from a dead one.
+        When a credential is configured a second, authenticated request
+        (``GET /api/conversations/count``, same ``APIKeyHeader`` scheme as the
+        conversation routes) confirms it.
+
+        The two failure modes stay distinct: a rejected token reports
+        ``credential_state=REJECTED``, while a 5xx, timeout, or unexpected status
+        on the probe reports ``UNKNOWN`` — a broken server must not be reported as
+        a bad credential, and neither is reported as healthy.
         """
         credential = self._credential_provider(environment)
         try:
@@ -133,27 +139,57 @@ class OpenHandsAdapter:
                 self._raise_for_status(response, environment)
                 payload = _json_object(response, environment)
 
-                if credential:
-                    probe = await client.get(CREDENTIAL_PROBE_PATH)
-                    if probe.status_code in (401, 403):
+                if not credential:
+                    state = CredentialState.NOT_CONFIGURED
+                else:
+                    state = await self._probe_credential(client, environment)
+                    if state is not CredentialState.ACCEPTED:
                         return HealthStatus(
                             reachable=False,
-                            detail=(
-                                "server reachable but rejected the credential; "
-                                "check the value of the configured credential env var"
-                            ),
+                            detail=_credential_failure_detail(state),
+                            credential_state=state,
                         )
-                    self._raise_for_status(probe, environment)
         except ProviderError as exc:
-            return HealthStatus(reachable=False, detail=exc.message)
+            # The probe itself can raise here (5xx -> ProviderUnavailable, a
+            # timeout, etc.). That is a server problem, not a rejected token.
+            return HealthStatus(
+                reachable=False,
+                detail=exc.message,
+                credential_state=(
+                    CredentialState.UNKNOWN if credential else CredentialState.NOT_CONFIGURED
+                ),
+            )
         except httpx.HTTPError as exc:
-            return HealthStatus(reachable=False, detail=_transport_detail(exc))
+            return HealthStatus(
+                reachable=False,
+                detail=_transport_detail(exc),
+                credential_state=(
+                    CredentialState.UNKNOWN if credential else CredentialState.NOT_CONFIGURED
+                ),
+            )
         version = payload.get("version")
         return HealthStatus(
             reachable=True,
             detail="agent server reachable",
             server_version=str(version) if version is not None else None,
+            credential_state=state,
         )
+
+    async def _probe_credential(
+        self, client: httpx.AsyncClient, environment: Environment
+    ) -> CredentialState:
+        """Ask an authenticated route whether the configured credential works.
+
+        Only 401/403 mean the token is bad. Anything else that is not a success
+        is ``UNKNOWN``: a 500 or 429 says nothing about the credential, and
+        reporting it as rejected would send the user to rotate a good token.
+        """
+        probe = await client.get(CREDENTIAL_PROBE_PATH)
+        if probe.status_code in (401, 403):
+            return CredentialState.REJECTED
+        if not probe.is_success:
+            return CredentialState.UNKNOWN
+        return CredentialState.ACCEPTED
 
     async def create_task(self, environment: Environment, request: TaskRequest) -> Task:
         payload: dict[str, Any] = {
@@ -562,6 +598,21 @@ def _safe_error_detail(response: httpx.Response) -> str:
             if messages:
                 return "; ".join(messages)[:300]
     return f"HTTP {response.status_code}"
+
+
+def _credential_failure_detail(state: CredentialState) -> str:
+    """Phrase the health detail by credential state, keeping causes distinct."""
+    if state is CredentialState.REJECTED:
+        return (
+            "server reachable but rejected the credential; check the value of the "
+            "configured credential env var"
+        )
+    # UNKNOWN: the probe could not settle the question. Say so rather than
+    # implying the token is bad or that the server is fine.
+    return (
+        "server reachable but the credential could not be verified; an "
+        "authenticated request returned an unexpected status"
+    )
 
 
 def _transport_detail(exc: httpx.HTTPError) -> str:

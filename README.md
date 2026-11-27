@@ -17,7 +17,7 @@ bounded logs, follow-up messages, and stop.
 | MCP tool | Effect |
 |---|---|
 | `list_environments` | List configured environments (sanitized, no credentials) |
-| `check_environment` | Reachability **and** credential check for one environment ID |
+| `check_environment` | Reachability **and** credential check for one environment ID (reports `credential_state`) |
 | `create_task` | Submit a prompt; returns a task ID |
 | `get_task` | Normalized status |
 | `get_task_logs` | Bounded, redacted log entries (max 100) |
@@ -140,6 +140,14 @@ A local Agent Server authenticates with the `X-Session-API-Key` header, not
 - Local server support only; cloud/relay is deferred.
 - Single provider (`openhands`). The adapter boundary exists so others can be
   added.
+- **Agent profiles are referenced by name or ID, but cannot be listed.** There is
+  no `list_agent_profiles` tool in v0.1: discovering a profile name is a
+  configuration step done against the server directly. Adding one is tracked for
+  Issue #6 and deliberately not part of this surface yet.
+- **An earlier hang is not explained.** Some conversations previously hung
+  instead of replying to a PING. Controlled runs during validation completed
+  normally, but the cause was not identified and the symptom may recur — see
+  [integration validation](docs/INTEGRATION-VALIDATION.md#not-verified).
 - Verified against Agent Server **1.60.1**; see
   [ADR 0002](docs/adr/0002-openhands-agent-server-api.md) and
   [integration validation](docs/INTEGRATION-VALIDATION.md) for exactly what was

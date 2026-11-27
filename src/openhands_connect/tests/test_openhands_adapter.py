@@ -25,6 +25,7 @@ from openhands_connect.adapters.openhands import (
 )
 from openhands_connect.domain.errors import ConfigurationError
 from openhands_connect.domain.models import (
+    CredentialState,
     Environment,
     ProviderError,
     ProviderErrorKind,
@@ -183,7 +184,7 @@ async def test_injected_redactor_secrets_survive_the_credential(
 
 
 async def test_health_check_reports_rejected_credential(environment: Environment) -> None:
-    """A 401 on the authenticated probe means the target is not usable."""
+    """A 401 on the authenticated probe means the credential is bad."""
 
     def handler(request: httpx.Request) -> httpx.Response:
         if request.url.path == "/server_info":
@@ -193,7 +194,70 @@ async def test_health_check_reports_rejected_credential(environment: Environment
     health = await adapter_for(handler, environment).health_check(environment)
 
     assert health.reachable is False
+    assert health.credential_state is CredentialState.REJECTED
     assert "credential" in health.detail
+
+
+async def test_health_check_reports_an_accepted_credential(environment: Environment) -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/server_info":
+            return httpx.Response(200, json={"version": "1.60.1"})
+        return httpx.Response(200, json=7)
+
+    health = await adapter_for(handler, environment).health_check(environment)
+
+    assert health.reachable is True
+    assert health.credential_state is CredentialState.ACCEPTED
+
+
+async def test_health_check_reports_no_credential_as_not_configured(
+    environment: Environment,
+) -> None:
+    def handler(_request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json={"version": "1.60.1"})
+
+    health = await adapter_for(handler, environment, credential=None).health_check(environment)
+
+    assert health.reachable is True
+    assert health.credential_state is CredentialState.NOT_CONFIGURED
+
+
+@pytest.mark.parametrize("status", [429, 500, 502, 503])
+async def test_probe_server_fault_is_unknown_not_a_rejected_credential(
+    environment: Environment, status: int
+) -> None:
+    """A broken server must not be reported as a bad token.
+
+    Only 401/403 mean the credential is wrong. A 5xx or 429 says nothing about
+    it, so the state is UNKNOWN — reporting REJECTED would send the user to
+    rotate a perfectly good token.
+    """
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/server_info":
+            return httpx.Response(200, json={"version": "1.60.1"})
+        return httpx.Response(status, json={"detail": "server-side problem"})
+
+    health = await adapter_for(handler, environment).health_check(environment)
+
+    assert health.reachable is False
+    assert health.credential_state is CredentialState.UNKNOWN
+
+
+async def test_probe_timeout_is_unknown_not_a_rejected_credential(
+    environment: Environment,
+) -> None:
+    """A timeout on the probe is an availability problem, not a bad token."""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/server_info":
+            return httpx.Response(200, json={"version": "1.60.1"})
+        raise httpx.ReadTimeout("slow probe")
+
+    health = await adapter_for(handler, environment).health_check(environment)
+
+    assert health.reachable is False
+    assert health.credential_state is CredentialState.UNKNOWN
 
 
 async def test_health_check_reports_unreachable_without_leaking_secret(

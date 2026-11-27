@@ -9,6 +9,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 
 from openhands_connect.domain.models import (
+    CredentialState,
     Environment,
     HealthStatus,
     ProviderNotFound,
@@ -31,6 +32,7 @@ class FakeProvider:
     reachable: bool = True
     health_detail: str = "fake reachable"
     server_version: str = "9.9.9"
+    credential_state: CredentialState = CredentialState.ACCEPTED
     state: TaskState = TaskState.RUNNING
     provider_state: str = "running"
     result_summary: str = "all done"
@@ -65,6 +67,7 @@ class FakeProvider:
             reachable=self.reachable,
             detail=self.health_detail,
             server_version=self.server_version,
+            credential_state=self.credential_state,
         )
 
     async def create_task(self, environment: Environment, request: TaskRequest) -> Task:

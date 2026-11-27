@@ -17,6 +17,8 @@ from openhands_connect.adapters.openhands import OpenHandsAdapter
 from openhands_connect.domain.models import (
     EXECUTION_OPERATIONS,
     READ_OPERATIONS,
+    CredentialState,
+    Environment,
     ProviderUnavailable,
     TaskLogEntry,
 )
@@ -420,3 +422,26 @@ async def test_mcp_boundary_redacts_credentials_in_every_text_field() -> None:
 
     for body in bodies:
         assert secret not in json.dumps(body), body
+
+
+async def test_check_environment_reports_the_credential_state(
+    environment: Environment,
+) -> None:
+    """The tool must expose the credential state, not just reachable.
+
+    A caller has to be able to tell "server down" from "my token is wrong"
+    without parsing prose, so the state is a structured field.
+    """
+    provider = FakeProvider(reachable=False, credential_state=CredentialState.REJECTED)
+    server = build_server(
+        ConnectService(
+            registry=EnvironmentRegistry((environment,)),
+            provider=provider,
+            policy=PolicyEngine(),
+        )
+    )
+
+    body = payload(await server.call_tool("check_environment", {"environment_id": "local"}))
+
+    assert body["reachable"] is False
+    assert body["credential_state"] == "rejected"

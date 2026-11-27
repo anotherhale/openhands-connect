@@ -200,6 +200,7 @@ class MCPTools:
         return {
             "environment_id": environment_id,
             "reachable": health.reachable,
+            "credential_state": health.credential_state.value,
             "detail": self._redactor.redact(health.detail),
             "server_version": health.server_version,
             "checked_at": health.checked_at.isoformat(),
