@@ -1,0 +1,49 @@
+# Example OpenHands Connect configuration.
+#
+# Copy to config/environments.yaml (or point OH_CONNECT_CONFIG at a copy) and
+# edit. Credentials are NEVER written here: an environment names the
+# environment variable that holds its token, and the value is read at call time.
+#
+# Every operation is opt-in. An environment that omits `allowed_operations`
+# permits nothing beyond being listed.
+
+schema_version: 1
+
+environments:
+  # A local OpenHands Agent Server started with:
+  #   agent-server --host 127.0.0.1 --port 18000
+  # A server started with session API keys (OH_SESSION_API_KEYS_0, as Agent
+  # Canvas does) rejects /api calls without a credential: set
+  # `credential_env_var: OH_LOCAL_KEY` and export that variable. Omit it only
+  # for a server started with no session keys at all.
+  - id: local
+    name: Local Agent Server
+    provider: openhands
+    base_url: http://127.0.0.1:18000
+    enabled: true
+    request_timeout_seconds: 30
+    default_agent_profile_id: autonomous
+    allowed_operations:
+      - check_environment
+      - create_task
+      - get_task
+      - get_task_logs
+      - get_task_result
+      - send_task_message
+      - stop_task
+
+  # A remote, authenticated server. The token lives in OH_STAGING_KEY and is
+  # never stored in this file.
+  - id: staging
+    name: Staging Agent Server
+    provider: openhands
+    base_url: https://staging-agents.internal.example.com
+    enabled: true
+    credential_env_var: OH_STAGING_KEY
+    request_timeout_seconds: 60
+    allowed_operations:
+      # Read-only: this environment cannot start or alter work.
+      - check_environment
+      - get_task
+      - get_task_logs
+      - get_task_result
