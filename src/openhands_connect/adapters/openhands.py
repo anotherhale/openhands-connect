@@ -13,7 +13,8 @@ from __future__ import annotations
 
 import logging
 import re
-from collections.abc import Callable
+from collections.abc import AsyncIterator, Callable
+from contextlib import asynccontextmanager
 from datetime import datetime
 from typing import Any
 
@@ -21,6 +22,7 @@ import httpx
 
 from openhands_connect.domain.errors import InvalidInputError
 from openhands_connect.domain.models import (
+    CredentialState,
     Environment,
     HealthStatus,
     ProviderError,
@@ -28,6 +30,7 @@ from openhands_connect.domain.models import (
     ProviderNotFound,
     ProviderProtocolError,
     ProviderRateLimited,
+    ProviderTimeout,
     ProviderUnauthorized,
     ProviderUnavailable,
     StopResult,
@@ -45,7 +48,12 @@ logger = logging.getLogger(__name__)
 
 API_KEY_HEADER = "X-Session-API-Key"
 MAX_LOG_TEXT_CHARS = 2_000
-MAX_LOG_ENTRIES = 200
+#: ``events/search`` rejects ``limit`` above 100 with a 422 (verified on
+#: Agent Server 1.60.1: "Input should be less than or equal to 100").
+MAX_LOG_ENTRIES = 100
+#: An authenticated route used to prove the credential is accepted.
+#: ``/server_info`` is unauthenticated and answers 200 even for a bad token.
+CREDENTIAL_PROBE_PATH = "/api/conversations/count"
 
 #: Upstream ``execution_status`` -> bridge state. Verified against
 #: ``ConversationExecutionStatus`` in the server OpenAPI document.
@@ -111,26 +119,77 @@ class OpenHandsAdapter:
         return self._redactor.with_secrets(credential)
 
     async def health_check(self, environment: Environment) -> HealthStatus:
+        """Report reachability *and* whether the credential is accepted.
+
+        ``/server_info`` is unauthenticated: it answers 200 with the version even
+        for a wrong key, so it alone cannot tell a working token from a dead one.
+        When a credential is configured a second, authenticated request
+        (``GET /api/conversations/count``, same ``APIKeyHeader`` scheme as the
+        conversation routes) confirms it.
+
+        The two failure modes stay distinct: a rejected token reports
+        ``credential_state=REJECTED``, while a 5xx, timeout, or unexpected status
+        on the probe reports ``UNKNOWN`` — a broken server must not be reported as
+        a bad credential, and neither is reported as healthy.
+        """
+        credential = self._credential_provider(environment)
         try:
-            async with self._client(environment) as client:
+            async with self._calling(environment) as client:
                 response = await client.get("/server_info")
-                if response.status_code in (401, 403):
-                    return HealthStatus(
-                        reachable=True,
-                        detail="server reachable but rejected the credential",
-                    )
                 self._raise_for_status(response, environment)
                 payload = _json_object(response, environment)
+
+                if not credential:
+                    state = CredentialState.NOT_CONFIGURED
+                else:
+                    state = await self._probe_credential(client, environment)
+                    if state is not CredentialState.ACCEPTED:
+                        return HealthStatus(
+                            reachable=False,
+                            detail=_credential_failure_detail(state),
+                            credential_state=state,
+                        )
         except ProviderError as exc:
-            return HealthStatus(reachable=False, detail=exc.message)
+            # The probe itself can raise here (5xx -> ProviderUnavailable, a
+            # timeout, etc.). That is a server problem, not a rejected token.
+            return HealthStatus(
+                reachable=False,
+                detail=exc.message,
+                credential_state=(
+                    CredentialState.UNKNOWN if credential else CredentialState.NOT_CONFIGURED
+                ),
+            )
         except httpx.HTTPError as exc:
-            return HealthStatus(reachable=False, detail=_transport_detail(exc))
+            return HealthStatus(
+                reachable=False,
+                detail=_transport_detail(exc),
+                credential_state=(
+                    CredentialState.UNKNOWN if credential else CredentialState.NOT_CONFIGURED
+                ),
+            )
         version = payload.get("version")
         return HealthStatus(
             reachable=True,
             detail="agent server reachable",
             server_version=str(version) if version is not None else None,
+            credential_state=state,
         )
+
+    async def _probe_credential(
+        self, client: httpx.AsyncClient, environment: Environment
+    ) -> CredentialState:
+        """Ask an authenticated route whether the configured credential works.
+
+        Only 401/403 mean the token is bad. Anything else that is not a success
+        is ``UNKNOWN``: a 500 or 429 says nothing about the credential, and
+        reporting it as rejected would send the user to rotate a good token.
+        """
+        probe = await client.get(CREDENTIAL_PROBE_PATH)
+        if probe.status_code in (401, 403):
+            return CredentialState.REJECTED
+        if not probe.is_success:
+            return CredentialState.UNKNOWN
+        return CredentialState.ACCEPTED
 
     async def create_task(self, environment: Environment, request: TaskRequest) -> Task:
         payload: dict[str, Any] = {
@@ -164,7 +223,7 @@ class OpenHandsAdapter:
                 "The OpenHands Agent Server rejects a conversation with none of them."
             )
 
-        async with self._client(environment) as client:
+        async with self._calling(environment) as client:
             if profile and not _looks_like_uuid(profile):
                 payload["agent_profile_id"] = await self._resolve_profile_id(
                     client, environment, profile
@@ -206,7 +265,7 @@ class OpenHandsAdapter:
         )
 
     async def get_task(self, environment: Environment, task_id: TaskId) -> Task:
-        async with self._client(environment) as client:
+        async with self._calling(environment) as client:
             response = await client.get(f"/api/conversations/{task_id}")
             self._raise_for_status(response, environment)
             body = _json_object(response, environment)
@@ -216,7 +275,7 @@ class OpenHandsAdapter:
         self, environment: Environment, task_id: TaskId, *, limit: int = 50
     ) -> TaskLogs:
         bounded = max(1, min(limit, MAX_LOG_ENTRIES))
-        async with self._client(environment) as client:
+        async with self._calling(environment) as client:
             response = await client.get(
                 f"/api/conversations/{task_id}/events/search",
                 params={"limit": bounded, "sort_order": "TIMESTAMP"},
@@ -242,7 +301,7 @@ class OpenHandsAdapter:
         )
 
     async def get_task_result(self, environment: Environment, task_id: TaskId) -> TaskResult:
-        async with self._client(environment) as client:
+        async with self._calling(environment) as client:
             task_response = await client.get(f"/api/conversations/{task_id}")
             self._raise_for_status(task_response, environment)
             task = _task_from_payload(_json_object(task_response, environment), environment)
@@ -278,7 +337,7 @@ class OpenHandsAdapter:
         )
 
     async def send_message(self, environment: Environment, task_id: TaskId, message: str) -> None:
-        async with self._client(environment) as client:
+        async with self._calling(environment) as client:
             response = await client.post(
                 f"/api/conversations/{task_id}/events",
                 json={
@@ -297,7 +356,7 @@ class OpenHandsAdapter:
         ``cancelled=True`` would claim something upstream cannot do, so the
         result keeps ``cancelled=False`` and states the real effect.
         """
-        async with self._client(environment) as client:
+        async with self._calling(environment) as client:
             response = await client.post(f"/api/conversations/{task_id}/interrupt")
             self._raise_for_status(response, environment)
             status_response = await client.get(f"/api/conversations/{task_id}")
@@ -330,6 +389,21 @@ class OpenHandsAdapter:
             transport=self._transport,
             follow_redirects=False,
         )
+
+    @asynccontextmanager
+    async def _calling(self, environment: Environment) -> AsyncIterator[httpx.AsyncClient]:
+        """Open a client and translate transport failures into provider errors.
+
+        ``httpx`` errors are not ``ProviderError``, so letting one escape makes
+        the tool layer answer ``internal_error``: the caller loses both the cause
+        and the retry hint. A refused connection or a timeout is an upstream
+        availability problem and is reported as one.
+        """
+        try:
+            async with self._client(environment) as client:
+                yield client
+        except httpx.HTTPError as exc:
+            raise _transport_error(exc, environment, self._redactor_for(environment)) from None
 
     def _raise_for_status(self, response: httpx.Response, environment: Environment) -> None:
         if response.is_success:
@@ -526,10 +600,47 @@ def _safe_error_detail(response: httpx.Response) -> str:
     return f"HTTP {response.status_code}"
 
 
+def _credential_failure_detail(state: CredentialState) -> str:
+    """Phrase the health detail by credential state, keeping causes distinct."""
+    if state is CredentialState.REJECTED:
+        return (
+            "server reachable but rejected the credential; check the value of the "
+            "configured credential env var"
+        )
+    # UNKNOWN: the probe could not settle the question. Say so rather than
+    # implying the token is bad or that the server is fine.
+    return (
+        "server reachable but the credential could not be verified; an "
+        "authenticated request returned an unexpected status"
+    )
+
+
 def _transport_detail(exc: httpx.HTTPError) -> str:
     if isinstance(exc, httpx.TimeoutException):
         return "request timed out"
     return f"connection failed: {type(exc).__name__}"
 
 
-__all__ = ["API_KEY_HEADER", "STATE_MAP", "OpenHandsAdapter", "map_state"]
+def _transport_error(
+    exc: httpx.HTTPError, environment: Environment, redactor: Redactor
+) -> ProviderError:
+    """Map a transport failure onto the provider taxonomy.
+
+    Only the exception *type* and a fixed phrase reach the message: the original
+    ``httpx`` text can name the host, a URL, or a header value.
+    """
+    detail = redactor.redact(_transport_detail(exc))
+    target = environment.id
+    if isinstance(exc, httpx.TimeoutException):
+        return ProviderTimeout(f"environment {target!r} did not respond in time: {detail}")
+    return ProviderUnavailable(f"environment {target!r} is unreachable: {detail}")
+
+
+__all__ = [
+    "API_KEY_HEADER",
+    "CREDENTIAL_PROBE_PATH",
+    "MAX_LOG_ENTRIES",
+    "STATE_MAP",
+    "OpenHandsAdapter",
+    "map_state",
+]

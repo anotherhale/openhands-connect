@@ -108,10 +108,29 @@ class Environment(Frozen):
         return self.enabled and operation in self.allowed_operations
 
 
+class CredentialState(StrEnum):
+    """Whether the configured credential was accepted.
+
+    Kept separate from ``reachable`` so a caller can tell "the server is down"
+    from "the server is up but my token is wrong" without parsing prose.
+    """
+
+    #: No credential is configured for this environment.
+    NOT_CONFIGURED = "not_configured"
+    #: A credential is configured and the server accepted it.
+    ACCEPTED = "accepted"
+    #: A credential is configured and the server rejected it (401/403).
+    REJECTED = "rejected"
+    #: A credential is configured but could not be checked (server error,
+    #: timeout, or an unexpected status). Never reported as accepted.
+    UNKNOWN = "unknown"
+
+
 class HealthStatus(Frozen):
     reachable: bool
     detail: str
     server_version: str | None = None
+    credential_state: CredentialState = CredentialState.NOT_CONFIGURED
     checked_at: datetime = Field(default_factory=lambda: datetime.now(UTC))
 
 

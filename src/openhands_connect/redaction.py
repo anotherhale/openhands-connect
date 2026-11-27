@@ -26,9 +26,17 @@ _HEADER_PATTERN = re.compile(
     r"(\s*[:=]\s*|\s+)(?:(bearer\s+))?((?![Bb]earer\b)[^\s,;\"'\[\]}\)]+)"
 )
 
-_JSON_SECRET_PATTERN = re.compile(
-    r"(?i)(\"[a-z0-9_-]*(?:api[_-]?key|token|secret|password|credential)"
-    r"[a-z0-9_-]*\"\s*:\s*)\"([^\"]*)\""
+#: A credential-named key assigned a value, in every shape upstream text takes:
+#: JSON (``"token": "x"``), a Python dict repr (``{'token': 'x'}``) or a bare
+#: ``token=x``. Key and value may each be quoted or not.
+#: A ``:`` or ``=`` separator is required so ordinary prose — "the token was
+#: refreshed" — is not rewritten. Upstream events are rendered with ``str()``,
+#: so the repr form is the shape that reached ``get_task_logs`` verbatim.
+_SECRET_ASSIGNMENT = re.compile(
+    r"(?i)(['\"]?[a-z0-9_.-]*"
+    r"(?:api[_-]?key|token|secret|password|passwd|credential)"
+    r"[a-z0-9_.-]*['\"]?\s*[:=]\s*)"
+    r"(['\"]?)([^'\"\s,;\[\]}\)]+)\2"
 )
 
 _SECRET_PATTERNS: tuple[tuple[re.Pattern[str], str], ...] = (
@@ -45,11 +53,11 @@ def _redact_header(match: re.Match[str]) -> str:
     return f"{name}{separator}{scheme or ''}{REDACTED}"
 
 
-def _redact_json_secret(match: re.Match[str]) -> str:
-    prefix, value = match.groups()
+def _redact_secret_assignment(match: re.Match[str]) -> str:
+    prefix, quote, value = match.groups()
     if value == REDACTED:
         return match.group(0)
-    return f'{prefix}"{REDACTED}"'
+    return f"{prefix}{quote}{REDACTED}{quote}"
 
 
 class Redactor:
@@ -80,7 +88,7 @@ class Redactor:
             if secret in result:
                 result = result.replace(secret, REDACTED)
         result = _HEADER_PATTERN.sub(_redact_header, result)
-        result = _JSON_SECRET_PATTERN.sub(_redact_json_secret, result)
+        result = _SECRET_ASSIGNMENT.sub(_redact_secret_assignment, result)
         for pattern, replacement in _SECRET_PATTERNS:
             result = pattern.sub(replacement, result)
         return result

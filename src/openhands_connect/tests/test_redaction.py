@@ -34,6 +34,48 @@ def test_literal_secret_is_removed_even_without_a_known_shape() -> None:
     assert REDACTED in result
 
 
+@pytest.mark.parametrize(
+    "text",
+    [
+        # Task logs render event payloads as Python dict reprs (single quotes),
+        # which is how the agent's own llm/mcp settings arrive in a log line.
+        "{'api_key': 'plainvalue12345'}",
+        "{'token': 'plainvalue12345'}",
+        "{'password': 'plainvalue12345'}",
+        "{'secret': 'plainvalue12345'}",
+        "{'credential': 'plainvalue12345'}",
+        "{'env': {'SLACK_BOT_TOKEN': 'plainvalue12345'}}",
+        '{"token": "plainvalue12345"}',
+        "token='plainvalue12345'",
+        "api_key=plainvalue12345",
+    ],
+)
+def test_single_quoted_and_unquoted_secret_assignments_are_redacted(text: str) -> None:
+    """A credential-named key must be scrubbed in repr form too, not only JSON.
+
+    The JSON pattern only matches double quotes, so ``{'token': 'x'}`` — the
+    shape upstream events actually produce — leaked the value verbatim into
+    ``get_task_logs`` output.
+    """
+    result = redact(text)
+    assert "plainvalue12345" not in result
+    assert REDACTED in result
+
+
+def test_secret_assignment_redaction_leaves_unrelated_prose_alone() -> None:
+    """Text without a credential-named key must survive untouched.
+
+    (A bare ``token <word>`` *is* redacted, by design: that is the shape a
+    pasted credential takes. Over-redacting prose is the accepted trade-off.)
+    """
+    for text in (
+        "the agent finished the task and reported success",
+        "wrote 3 files and ran pytest successfully",
+        "state execution_status=finished",
+    ):
+        assert redact(text) == text
+
+
 def test_longest_literal_secret_wins() -> None:
     """A secret containing another secret must be fully removed."""
     inner, outer = "abcdef", "abcdef-extended"
