@@ -32,13 +32,32 @@ names a credential variable.
 |---|---|---|
 | GET | `/server_info` | health check; **unauthenticated**, returns `version` |
 | GET | `/api/conversations/count` | credential probe for health (see below) |
+| GET | `/ready` | readiness probe: `200` when initialized, `503` while starting |
 | GET | `/api/agent-profiles` | resolve a profile **name** to its UUID |
-| POST | `/api/conversations` | create a task (conversation) |
+| POST | `/api/conversations` | create a task (conversation), with caller-supplied `conversation_id` |
 | GET | `/api/conversations/{id}` | task status |
 | GET | `/api/conversations/{id}/events/search` | bounded log retrieval |
 | GET | `/api/conversations/{id}/agent_final_response` | task result |
-| POST | `/api/conversations/{id}/events` | follow-up message |
+| POST | `/api/conversations/{id}/events` | follow-up message (sent with `run=False`) |
+| POST | `/api/conversations/{id}/run` | start the run after a saved message |
 | POST | `/api/conversations/{id}/interrupt` | stop (see limitations) |
+
+### Idempotent creation and the two-step message send
+
+Verified on 1.60.1 (see `docs/RELIABILITY.md` for the probes):
+
+- **`POST /api/conversations` is idempotent when `conversation_id` is supplied.**
+  Repeating it returned `201` then `200` for the same conversation, with no
+  duplicate initial message and no re-run of a finished task. The adapter always
+  generates the id, which is what makes a create retry safe.
+- **`POST /run` answers `409` while already running**, which the adapter reads as
+  "a run is in progress" (i.e. started), and **`POST /interrupt` is idempotent**
+  (repeated `200`s).
+- **The message save is not idempotent.** It is therefore attempted once, and the
+  run is started by a separate `POST /run`. A single `run=True` request would
+  collapse "not stored" and "stored but not running" into one status.
+- **A malformed id returns `422` (`uuid_parsing`), an unknown one `404`.** These
+  are reported as `InvalidInputError` and `ProviderNotFound` respectively.
 
 ### The health check must make two requests
 

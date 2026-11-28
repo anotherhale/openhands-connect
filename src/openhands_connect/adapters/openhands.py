@@ -11,8 +11,10 @@ package, routes under ``/api``), not the Sandbox Server control plane
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import re
+import uuid
 from collections.abc import AsyncIterator, Callable
 from contextlib import asynccontextmanager
 from datetime import datetime
@@ -25,6 +27,8 @@ from openhands_connect.domain.models import (
     CredentialState,
     Environment,
     HealthStatus,
+    MessageDelivery,
+    ProviderAmbiguousWrite,
     ProviderError,
     ProviderInvalidRequest,
     ProviderNotFound,
@@ -54,6 +58,31 @@ MAX_LOG_ENTRIES = 100
 #: An authenticated route used to prove the credential is accepted.
 #: ``/server_info`` is unauthenticated and answers 200 even for a bad token.
 CREDENTIAL_PROBE_PATH = "/api/conversations/count"
+#: Readiness route: 200 only after initialization, 503 while starting.
+READINESS_PATH = "/ready"
+
+#: Statuses worth another attempt on a call proven safe to repeat. 429 is the
+#: documented "run capacity full"; the 5xx set is the gateway/overload family.
+#: A plain 500 is *not* retried: it usually means the server is broken, and
+#: retrying only adds load.
+RETRYABLE_STATUSES = frozenset({429, 502, 503, 504})
+#: Exponential backoff, capped. Kept small so a tool call stays interactive.
+RETRY_BASE_DELAY_SECONDS: float = 0.25
+RETRY_MAX_DELAY_SECONDS: float = 4.0
+
+#: Transport failures that prove the request never reached the server. A write
+#: failing this way definitely did *not* happen, so it is a plain failure rather
+#: than an ambiguous one.
+_CONNECT_FAILURES = (httpx.ConnectError, httpx.ConnectTimeout, httpx.PoolTimeout)
+#: Transport failures where the request may have been delivered and applied.
+#: For a non-idempotent write these are ambiguous, never a reported failure.
+_AMBIGUOUS_FAILURES = (
+    httpx.ReadTimeout,
+    httpx.WriteTimeout,
+    httpx.ReadError,
+    httpx.WriteError,
+    httpx.RemoteProtocolError,
+)
 
 #: Upstream ``execution_status`` -> bridge state. Verified against
 #: ``ConversationExecutionStatus`` in the server OpenAPI document.
@@ -119,24 +148,27 @@ class OpenHandsAdapter:
         return self._redactor.with_secrets(credential)
 
     async def health_check(self, environment: Environment) -> HealthStatus:
-        """Report reachability *and* whether the credential is accepted.
+        """Report reachability, readiness, *and* whether the credential is accepted.
 
         ``/server_info`` is unauthenticated: it answers 200 with the version even
         for a wrong key, so it alone cannot tell a working token from a dead one.
         When a credential is configured a second, authenticated request
         (``GET /api/conversations/count``, same ``APIKeyHeader`` scheme as the
-        conversation routes) confirms it.
+        conversation routes) confirms it. ``GET /ready`` then reports whether the
+        server has finished initializing (503 while starting).
 
-        The two failure modes stay distinct: a rejected token reports
-        ``credential_state=REJECTED``, while a 5xx, timeout, or unexpected status
-        on the probe reports ``UNKNOWN`` — a broken server must not be reported as
-        a bad credential, and neither is reported as healthy.
+        The failure modes stay distinct: a rejected token reports
+        ``credential_state=REJECTED``, a starting server reports ``ready=False``,
+        while a 5xx, timeout, or unexpected status on a probe reports
+        ``credential_state=UNKNOWN`` — a broken server must not be reported as a
+        bad credential, and none of them is reported as healthy.
         """
         credential = self._credential_provider(environment)
         try:
             async with self._calling(environment) as client:
-                response = await client.get("/server_info")
-                self._raise_for_status(response, environment)
+                response = await self._send(
+                    client, environment, "GET", "/server_info", idempotent=True
+                )
                 payload = _json_object(response, environment)
 
                 if not credential:
@@ -149,6 +181,17 @@ class OpenHandsAdapter:
                             detail=_credential_failure_detail(state),
                             credential_state=state,
                         )
+                ready = await self._probe_readiness(client)
+                if ready is False:
+                    return HealthStatus(
+                        reachable=True,
+                        ready=False,
+                        detail=(
+                            "server is reachable but not ready to accept work "
+                            "(initializing); retry shortly"
+                        ),
+                        credential_state=state,
+                    )
         except ProviderError as exc:
             # The probe itself can raise here (5xx -> ProviderUnavailable, a
             # timeout, etc.). That is a server problem, not a rejected token.
@@ -170,10 +213,27 @@ class OpenHandsAdapter:
         version = payload.get("version")
         return HealthStatus(
             reachable=True,
+            ready=ready,
             detail="agent server reachable",
             server_version=str(version) if version is not None else None,
             credential_state=state,
         )
+
+    async def _probe_readiness(self, client: httpx.AsyncClient) -> bool | None:
+        """Ask ``/ready`` whether the server finished initializing.
+
+        Returns ``None`` when the route is absent (older server) or answers an
+        unexpected status: readiness is then simply not claimed, never assumed.
+        """
+        try:
+            probe = await client.get(READINESS_PATH)
+        except httpx.HTTPError:
+            return None
+        if probe.is_success:
+            return True
+        if probe.status_code == 503:
+            return False
+        return None
 
     async def _probe_credential(
         self, client: httpx.AsyncClient, environment: Environment
@@ -192,7 +252,14 @@ class OpenHandsAdapter:
         return CredentialState.ACCEPTED
 
     async def create_task(self, environment: Environment, request: TaskRequest) -> Task:
+        # A caller-supplied id makes creation idempotent: repeating the POST with
+        # the same id returns the same conversation without re-adding the initial
+        # message or restarting a finished run (verified on 1.60.1). That is what
+        # makes a retry safe, and what lets an ambiguous outcome name the task id
+        # the caller can check instead of retrying blindly.
+        conversation_id = str(uuid.uuid4())
         payload: dict[str, Any] = {
+            "conversation_id": conversation_id,
             "workspace": {
                 "kind": "LocalWorkspace",
                 "working_dir": request.workspace or ".",
@@ -228,8 +295,15 @@ class OpenHandsAdapter:
                 payload["agent_profile_id"] = await self._resolve_profile_id(
                     client, environment, profile
                 )
-            response = await client.post("/api/conversations", json=payload)
-            self._raise_for_status(response, environment)
+            response = await self._send(
+                client,
+                environment,
+                "POST",
+                "/api/conversations",
+                idempotent=True,
+                task_id=conversation_id,
+                json=payload,
+            )
             body = _json_object(response, environment)
         return _task_from_payload(body, environment)
 
@@ -242,8 +316,9 @@ class OpenHandsAdapter:
         only a parse failure, so a config file holding a readable name would
         otherwise fail with an error that never mentions profiles.
         """
-        response = await client.get("/api/agent-profiles")
-        self._raise_for_status(response, environment)
+        response = await self._send(
+            client, environment, "GET", "/api/agent-profiles", idempotent=True
+        )
         body = _json_object(response, environment)
         raw = body.get("profiles", body.get("items", body.get("agent_profiles")))
         candidates = raw if isinstance(raw, list) else [raw] if raw else []
@@ -266,8 +341,15 @@ class OpenHandsAdapter:
 
     async def get_task(self, environment: Environment, task_id: TaskId) -> Task:
         async with self._calling(environment) as client:
-            response = await client.get(f"/api/conversations/{task_id}")
-            self._raise_for_status(response, environment)
+            response = await self._send(
+                client,
+                environment,
+                "GET",
+                f"/api/conversations/{task_id}",
+                idempotent=True,
+                task_id=task_id,
+                task_id_in_path=True,
+            )
             body = _json_object(response, environment)
         return _task_from_payload(body, environment)
 
@@ -276,11 +358,16 @@ class OpenHandsAdapter:
     ) -> TaskLogs:
         bounded = max(1, min(limit, MAX_LOG_ENTRIES))
         async with self._calling(environment) as client:
-            response = await client.get(
+            response = await self._send(
+                client,
+                environment,
+                "GET",
                 f"/api/conversations/{task_id}/events/search",
+                idempotent=True,
+                task_id=task_id,
+                task_id_in_path=True,
                 params={"limit": bounded, "sort_order": "TIMESTAMP"},
             )
-            self._raise_for_status(response, environment)
             body = _json_object(response, environment)
 
         raw_items = body.get("items")
@@ -302,8 +389,15 @@ class OpenHandsAdapter:
 
     async def get_task_result(self, environment: Environment, task_id: TaskId) -> TaskResult:
         async with self._calling(environment) as client:
-            task_response = await client.get(f"/api/conversations/{task_id}")
-            self._raise_for_status(task_response, environment)
+            task_response = await self._send(
+                client,
+                environment,
+                "GET",
+                f"/api/conversations/{task_id}",
+                idempotent=True,
+                task_id=task_id,
+                task_id_in_path=True,
+            )
             task = _task_from_payload(_json_object(task_response, environment), environment)
 
             if task.state is not TaskState.COMPLETED:
@@ -315,8 +409,15 @@ class OpenHandsAdapter:
                     detail=f"no final response while task state is {task.state.value}",
                 )
 
-            response = await client.get(f"/api/conversations/{task_id}/agent_final_response")
-            self._raise_for_status(response, environment)
+            response = await self._send(
+                client,
+                environment,
+                "GET",
+                f"/api/conversations/{task_id}/agent_final_response",
+                idempotent=True,
+                task_id=task_id,
+                task_id_in_path=True,
+            )
             body = _json_object(response, environment)
 
         response_text = body.get("response")
@@ -336,17 +437,92 @@ class OpenHandsAdapter:
             summary=self._redactor_for(environment).redact(response_text),
         )
 
-    async def send_message(self, environment: Environment, task_id: TaskId, message: str) -> None:
+    async def send_message(
+        self, environment: Environment, task_id: TaskId, message: str
+    ) -> MessageDelivery:
+        """Save a follow-up message, then start the run that consumes it.
+
+        The two steps are separate upstream operations, and upstream can accept
+        the save while refusing the run (429 "run capacity is full"). Sending
+        with ``run=True`` in one call would collapse both into one status and
+        leave the caller unable to tell "not delivered" from "delivered but not
+        running" — the exact ambiguity this split removes.
+
+        The save is not retried: a duplicate would add the message twice. It is
+        attempted once and, on an undetermined transport failure, reported as an
+        ambiguous write rather than a failure.
+        """
         async with self._calling(environment) as client:
-            response = await client.post(
+            await self._send(
+                client,
+                environment,
+                "POST",
                 f"/api/conversations/{task_id}/events",
+                idempotent=False,
+                task_id=task_id,
+                task_id_in_path=True,
                 json={
                     "role": "user",
                     "content": [{"type": "text", "text": message}],
-                    "run": True,
+                    # run=False so a refused run below cannot lose the message.
+                    "run": False,
                 },
             )
-            self._raise_for_status(response, environment)
+            started = await self._start_run(client, environment, task_id)
+
+        if started is True:
+            detail = "message saved and the run started; poll get_task for progress"
+        elif started is False:
+            detail = (
+                "message saved but the run did not start because the server's run "
+                "capacity is full; the message is stored. Start it later by sending "
+                "another message, or retry after other runs finish."
+            )
+        else:
+            detail = (
+                "message saved, but whether the run started could not be confirmed "
+                "because the run request failed. The message is stored; check get_task "
+                "for progress before sending it again."
+            )
+        return MessageDelivery(
+            task_id=task_id,
+            environment_id=environment.id,
+            saved=True,
+            started=started,
+            detail=detail,
+        )
+
+    async def _start_run(
+        self, client: httpx.AsyncClient, environment: Environment, task_id: TaskId
+    ) -> bool | None:
+        """Start the run, distinguishing refused / started / undetermined.
+
+        ``POST /run`` is safe to repeat: a second call while already running
+        answers 409, which means a run *is* in progress — i.e. started — so 409 is
+        accepted rather than raised. A 429 (run capacity full) is a definite "did
+        not start" and returns ``False``.
+
+        Anything else — a 5xx, a timeout, or a lost response — cannot be shown
+        either way, so it returns ``None`` instead of raising. Raising here would
+        discard the fact that the message *was* already saved, and the caller
+        would retry the whole send, storing the message twice.
+        """
+        try:
+            await self._send(
+                client,
+                environment,
+                "POST",
+                f"/api/conversations/{task_id}/run",
+                idempotent=True,
+                task_id=task_id,
+                task_id_in_path=True,
+                ok_statuses=frozenset({409}),
+            )
+        except ProviderRateLimited:
+            return False
+        except ProviderError:
+            return None
+        return True
 
     async def stop_task(self, environment: Environment, task_id: TaskId) -> StopResult:
         """Pause the task, and say plainly that it was not terminated.
@@ -355,12 +531,29 @@ class OpenHandsAdapter:
         the conversation in ``paused``; no endpoint terminates a run. Reporting
         ``cancelled=True`` would claim something upstream cannot do, so the
         result keeps ``cancelled=False`` and states the real effect.
+
+        ``interrupt`` is idempotent upstream (a second call answers 200), so it
+        is retried on 5xx/timeout like a read.
         """
         async with self._calling(environment) as client:
-            response = await client.post(f"/api/conversations/{task_id}/interrupt")
-            self._raise_for_status(response, environment)
-            status_response = await client.get(f"/api/conversations/{task_id}")
-            self._raise_for_status(status_response, environment)
+            await self._send(
+                client,
+                environment,
+                "POST",
+                f"/api/conversations/{task_id}/interrupt",
+                idempotent=True,
+                task_id=task_id,
+                task_id_in_path=True,
+            )
+            status_response = await self._send(
+                client,
+                environment,
+                "GET",
+                f"/api/conversations/{task_id}",
+                idempotent=True,
+                task_id=task_id,
+                task_id_in_path=True,
+            )
             task = _task_from_payload(_json_object(status_response, environment), environment)
 
         return StopResult(
@@ -433,6 +626,181 @@ class OpenHandsAdapter:
         raise ProviderProtocolError(
             f"environment {target!r} returned unexpected status {status}: {detail}"
         )
+
+    async def _send(
+        self,
+        client: httpx.AsyncClient,
+        environment: Environment,
+        method: str,
+        path: str,
+        *,
+        idempotent: bool,
+        task_id: str | None = None,
+        task_id_in_path: bool = False,
+        ok_statuses: frozenset[int] = frozenset(),
+        **kwargs: Any,
+    ) -> httpx.Response:
+        """Perform one request, retrying only what is safe to repeat.
+
+        Retry policy (documented in ``docs/RELIABILITY.md``):
+
+        * A read, or a write the caller has proven idempotent (``idempotent``),
+          is retried on a timeout, a connect failure, or a status in
+          ``RETRYABLE_STATUSES``, up to ``environment.max_attempts``, with capped
+          exponential backoff that honours ``Retry-After``.
+        * A non-idempotent write is attempted exactly once. A 4xx proves it was
+          rejected, so it is a plain failure; a 5xx or a lost response leaves the
+          outcome undetermined, so it raises ``ProviderAmbiguousWrite`` rather
+          than a false failure or a false success, and a caller never retries
+          into a duplicate.
+
+        ``ok_statuses`` names non-2xx statuses the caller treats as success (e.g.
+        409 for "a run is already in progress"); they are returned, not raised.
+
+        Only the exception *type* and fixed phrases reach the message: the
+        original ``httpx`` text can name a host, a URL, or a header value.
+        """
+        attempts = environment.max_attempts if idempotent else 1
+        last_transport: httpx.HTTPError | None = None
+        response: httpx.Response | None = None
+
+        for attempt in range(attempts):
+            retryable_status = False
+            retry_after: float | None = None
+            # Reset per attempt: a stale response from an earlier attempt must
+            # not be what gets reported if a later attempt fails in transport.
+            response = None
+            try:
+                response = await client.request(method, path, **kwargs)
+            except httpx.HTTPError as exc:
+                last_transport = exc
+                if not idempotent:
+                    raise self._write_failure(exc, environment, task_id=task_id) from None
+                if not isinstance(exc, _CONNECT_FAILURES + _AMBIGUOUS_FAILURES):
+                    raise _transport_error(
+                        exc, environment, self._redactor_for(environment)
+                    ) from None
+            else:
+                if response.is_success or response.status_code in ok_statuses:
+                    return response
+                if task_id_in_path and _is_task_id_parse_error(response):
+                    raise _invalid_task_id(task_id, environment, response)
+                if not idempotent:
+                    # 4xx was rejected before it applied anything; a 5xx cannot
+                    # be shown not to have applied, so it is ambiguous.
+                    if response.status_code >= 500:
+                        raise self._ambiguous_status(response, environment, task_id=task_id)
+                    self._raise_for_status(response, environment)
+                retryable_status = response.status_code in RETRYABLE_STATUSES
+                retry_after = _retry_after_seconds(response)
+                if not retryable_status:
+                    self._raise_for_status(response, environment)
+
+            if attempt + 1 >= attempts:
+                break
+            await asyncio.sleep(_backoff_delay(attempt, retry_after))
+
+        if response is not None:
+            self._raise_for_status(response, environment)
+        if last_transport is not None:
+            raise _transport_error(last_transport, environment, self._redactor_for(environment))
+        raise ProviderUnavailable(
+            f"environment {environment.id!r} did not respond after {attempts} attempts"
+        )
+
+    def _ambiguous_status(
+        self, response: httpx.Response, environment: Environment, *, task_id: str | None
+    ) -> ProviderAmbiguousWrite:
+        """A 5xx to a non-idempotent write: the request arrived, the effect is unknown.
+
+        The handler may have applied the change before failing, or a gateway may
+        have applied it and then failed to relay the reply. Neither success nor
+        failure is provable, so it is reported as ambiguous.
+        """
+        detail = self._redactor_for(environment).redact(_safe_error_detail(response))
+        hint = (
+            f" The write was keyed on {task_id!r}; check that id before retrying."
+            if task_id
+            else " Do not retry blindly: the effect may already have been applied."
+        )
+        return ProviderAmbiguousWrite(
+            f"environment {environment.id!r} returned {response.status_code} for a mutating "
+            f"request; it may or may not have been applied ({detail})." + hint,
+            task_id=task_id,
+        )
+
+    def _write_failure(
+        self, exc: httpx.HTTPError, environment: Environment, *, task_id: str | None
+    ) -> ProviderError:
+        """Classify a non-retryable write's transport failure.
+
+        A refused/timed-out *connection* proves nothing was sent, so it is an
+        ordinary failure. A read/write timeout or a reset after the request went
+        out leaves the effect undetermined: report that, do not claim failure.
+        """
+        target = environment.id
+        redactor = self._redactor_for(environment)
+        if isinstance(exc, _CONNECT_FAILURES) and not isinstance(exc, _AMBIGUOUS_FAILURES):
+            return ProviderUnavailable(
+                f"environment {target!r} is unreachable: {redactor.redact(_transport_detail(exc))}"
+            )
+        if isinstance(exc, _AMBIGUOUS_FAILURES):
+            hint = (
+                f" The write was keyed on {task_id!r}; check that id before retrying."
+                if task_id
+                else " Do not retry blindly: the effect may already have been applied."
+            )
+            return ProviderAmbiguousWrite(
+                f"environment {target!r} did not confirm the result of a mutating "
+                f"request ({type(exc).__name__}); it may or may not have been applied." + hint,
+                task_id=task_id,
+            )
+        return _transport_error(exc, environment, redactor)
+
+
+def _is_task_id_parse_error(response: httpx.Response) -> bool:
+    """Whether a 422 is specifically about the conversation id in the path.
+
+    A 422 on a task-scoped route is not automatically about the id: the message
+    body is validated on the same route, and mislabelling a rejected body as a
+    malformed task id sends the caller to fix the wrong thing. FastAPI's
+    ``RequestValidationError`` names the offending location, so the check looks
+    for the path parameter. When the body is not the expected JSON shape the
+    check declines to claim it, falling back to a generic invalid-request.
+    """
+    if response.status_code != 422:
+        return False
+    try:
+        body = response.json()
+    except ValueError:
+        return False
+    errors = body.get("detail") if isinstance(body, dict) else None
+    if not isinstance(errors, list):
+        return False
+    for error in errors:
+        if not isinstance(error, dict):
+            continue
+        location = error.get("loc")
+        if isinstance(location, list) and "path" in location and "conversation_id" in location:
+            return True
+    return False
+
+
+def _invalid_task_id(
+    task_id: str | None, environment: Environment, response: httpx.Response
+) -> InvalidInputError:
+    """Report a task id upstream cannot even parse as a caller input error.
+
+    A non-UUID id yields a 422 ``uuid_parsing`` failure, which is a different
+    problem from a well-formed id the server does not know (404). Folding both
+    into one message would send a caller looking for a deleted task when the id
+    was simply malformed.
+    """
+    detail = Redactor().redact(_safe_error_detail(response))
+    return InvalidInputError(
+        f"task id {task_id!r} is not valid for environment {environment.id!r}: "
+        f"upstream requires a UUID conversation id ({detail})"
+    )
 
 
 def _task_from_payload(payload: dict[str, Any], environment: Environment) -> Task:
@@ -619,6 +987,35 @@ def _transport_detail(exc: httpx.HTTPError) -> str:
     if isinstance(exc, httpx.TimeoutException):
         return "request timed out"
     return f"connection failed: {type(exc).__name__}"
+
+
+def _retry_after_seconds(response: httpx.Response) -> float | None:
+    """Parse a ``Retry-After`` delay in seconds, ignoring the HTTP-date form.
+
+    A date would need clock comparison; treating it as absent falls back to
+    exponential backoff, which is bounded and always terminates.
+    """
+    raw = response.headers.get("retry-after")
+    if not raw:
+        return None
+    try:
+        value = float(raw.strip())
+    except ValueError:
+        return None
+    return value if value >= 0 else None
+
+
+def _backoff_delay(attempt: int, retry_after: float | None) -> float:
+    """Capped exponential backoff, honouring a ``Retry-After`` hint.
+
+    The hint is clamped to ``RETRY_MAX_DELAY_SECONDS`` so a server asking for a
+    long wait cannot stall a tool call; the caller then sees the 429 instead.
+    """
+    if retry_after is not None:
+        return min(retry_after, RETRY_MAX_DELAY_SECONDS)
+    # ``2.0 ** attempt`` rather than ``2 ** attempt``: mypy types int**int as
+    # Any (a negative exponent would be a float), which would leak Any out.
+    return min(RETRY_BASE_DELAY_SECONDS * (2.0**attempt), RETRY_MAX_DELAY_SECONDS)
 
 
 def _transport_error(

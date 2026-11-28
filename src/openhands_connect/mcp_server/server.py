@@ -6,6 +6,8 @@ tests can drive the real handlers with a fake provider and no network.
 
 from __future__ import annotations
 
+from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
 from typing import Any
 
 from mcp.server.mcpserver import MCPServer
@@ -32,9 +34,24 @@ _EXECUTION_WARNING = (
 
 def build_server(service: ConnectService) -> MCPServer:
     tools = MCPTools(service)
+
+    @asynccontextmanager
+    async def lifespan(_server: MCPServer) -> AsyncIterator[None]:
+        """Release provider resources when the MCP session ends.
+
+        The stdio transport ends this context when the client disconnects or the
+        process is told to stop, so a provider holding connections gets a clean
+        shutdown instead of being dropped mid-flight.
+        """
+        try:
+            yield
+        finally:
+            await service.provider.aclose()
+
     server: MCPServer = MCPServer(
         name=SERVER_NAME,
         version=SERVER_VERSION,
+        lifespan=lifespan,
         instructions=(
             "Bridge to explicitly configured OpenHands execution environments. "
             "Call list_environments first, then pass an environment_id to every "

@@ -200,6 +200,7 @@ class MCPTools:
         return {
             "environment_id": environment_id,
             "reachable": health.reachable,
+            "ready": health.ready,
             "credential_state": health.credential_state.value,
             "detail": self._redactor.redact(health.detail),
             "server_version": health.server_version,
@@ -274,14 +275,19 @@ class MCPTools:
         self, environment_id: EnvironmentIdArg, task_id: TaskIdArg, message: MessageArg
     ) -> dict[str, Any]:
         try:
-            await self._service.send_task_message(environment_id, task_id, message)
+            delivery = await self._service.send_task_message(environment_id, task_id, message)
         except Exception as exc:
             return error_payload(exc)
+        # ``sent`` means "the run will act on it". A saved message whose run was
+        # refused (429 run capacity) is reported as sent=False, started=False,
+        # saved=True, so a caller never reads a stored-but-idle message as done.
         return {
-            "task_id": task_id,
-            "environment_id": environment_id,
-            "sent": True,
-            "note": "Message delivered. Poll get_task for the updated state.",
+            "task_id": delivery.task_id,
+            "environment_id": delivery.environment_id,
+            "saved": delivery.saved,
+            "started": delivery.started,
+            "sent": delivery.saved and delivery.started is True,
+            "detail": self._redactor.redact(delivery.detail),
         }
 
     async def stop_task(

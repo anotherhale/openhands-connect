@@ -23,7 +23,7 @@ from openhands_connect.adapters.openhands import (
     OpenHandsAdapter,
     map_state,
 )
-from openhands_connect.domain.errors import ConfigurationError
+from openhands_connect.domain.errors import ConfigurationError, InvalidInputError
 from openhands_connect.domain.models import (
     CredentialState,
     Environment,
@@ -507,7 +507,6 @@ async def test_json_array_response_is_a_protocol_error(environment: Environment)
         (401, ProviderUnauthorized),
         (403, ProviderUnauthorized),
         (404, ProviderNotFound),
-        (422, ProviderInvalidRequest),
         (429, ProviderRateLimited),
         (500, ProviderUnavailable),
         (503, ProviderUnavailable),
@@ -521,7 +520,13 @@ async def test_http_status_maps_to_provider_error(
         await adapter_for(handler, environment).get_task(environment, "t1")
 
 
-async def test_422_detail_list_is_summarized(environment: Environment) -> None:
+async def test_task_id_422_is_an_invalid_input_error(environment: Environment) -> None:
+    """A non-UUID task id is a caller mistake, not an upstream failure.
+
+    Verified on 1.60.1: a malformed id returns 422 ``uuid_parsing`` while a
+    well-formed unknown id returns 404. The two must not be conflated, or a
+    caller is sent hunting for a deleted task when the id was simply malformed.
+    """
     payload = {
         "detail": [
             {
@@ -533,9 +538,23 @@ async def test_422_detail_list_is_summarized(environment: Environment) -> None:
     }
     handler: Handler = lambda _request: httpx.Response(422, json=payload)
 
-    with pytest.raises(ProviderInvalidRequest) as excinfo:
+    with pytest.raises(InvalidInputError) as excinfo:
         await adapter_for(handler, environment).get_task(environment, "t1")
-    assert "Input should be a valid UUID" in str(excinfo.value)
+    assert "t1" in str(excinfo.value)
+    assert "UUID" in str(excinfo.value)
+
+
+async def test_422_on_a_non_task_route_stays_a_provider_error(
+    environment: Environment,
+) -> None:
+    """Only a 422 on a task-scoped route is a bad task id.
+
+    A 422 from create (e.g. no agent source) is an upstream contract failure and
+    must keep its ``invalid_request`` classification.
+    """
+    handler: Handler = lambda _request: httpx.Response(422, json={"detail": "nope"})
+    with pytest.raises(ProviderInvalidRequest):
+        await adapter_for(handler, environment).create_task(environment, TaskRequest(prompt="x"))
 
 
 async def test_error_message_never_contains_the_credential(environment: Environment) -> None:
@@ -740,21 +759,55 @@ async def test_empty_final_response_is_not_reported_as_a_result(
 # -- messaging and stop -----------------------------------------------------
 
 
-async def test_send_message_posts_a_running_user_message(environment: Environment) -> None:
+async def test_send_message_saves_then_starts_the_run(environment: Environment) -> None:
+    """The save and the run are separate requests, so a refused run is visible.
+
+    Sending ``run=True`` in one request would collapse both outcomes; a 429 on
+    the run would then look like the message was never stored.
+    """
     captured: dict[str, object] = {}
+    paths: list[str] = []
 
     def handler(request: httpx.Request) -> httpx.Response:
-        assert request.url.path == "/api/conversations/t1/events"
-        captured.update(json.loads(request.content))
+        paths.append(request.url.path)
+        if request.url.path.endswith("/events"):
+            captured.update(json.loads(request.content))
+            return httpx.Response(200, json={"success": True})
         return httpx.Response(200, json={"success": True})
 
-    await adapter_for(handler, environment).send_message(environment, "t1", "keep going")
+    delivery = await adapter_for(handler, environment).send_message(environment, "t1", "keep going")
 
+    assert paths == ["/api/conversations/t1/events", "/api/conversations/t1/run"]
+    # The save must not itself trigger a run, or a refused /run loses the message.
     assert captured == {
         "role": "user",
         "content": [{"type": "text", "text": "keep going"}],
-        "run": True,
+        "run": False,
     }
+    assert delivery.saved is True
+    assert delivery.started is True
+
+
+async def test_send_message_reports_a_refused_run_as_saved_not_started(
+    environment: Environment,
+) -> None:
+    """A 429 on the run must not be reported as a failed send.
+
+    Verified on 1.60.1: ``POST /events`` 429 means "message saved but server run
+    capacity is full". Because the save and run are separate, the message is
+    provably stored and only the run is refused.
+    """
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path.endswith("/run"):
+            return httpx.Response(429, json={"detail": "run capacity full"})
+        return httpx.Response(200, json={"success": True})
+
+    delivery = await adapter_for(handler, environment).send_message(environment, "t1", "hi")
+
+    assert delivery.saved is True
+    assert delivery.started is False
+    assert "capacity" in delivery.detail
 
 
 async def test_stop_task_does_not_claim_cancellation(environment: Environment) -> None:
@@ -789,10 +842,13 @@ async def test_adapter_uses_the_environment_base_url() -> None:
     await adapter.health_check(first)
     await adapter.health_check(second)
 
-    # Each health check makes two calls: /server_info, then the credential probe.
+    # Each health check makes three calls against that environment's host:
+    # /server_info, the credential probe, then /ready.
     assert seen == [
         "127.0.0.1:18000",
         "127.0.0.1:18000",
+        "127.0.0.1:18000",
+        "127.0.0.1:19000",
         "127.0.0.1:19000",
         "127.0.0.1:19000",
     ]
@@ -867,7 +923,10 @@ async def test_health_check_skips_the_credential_probe_when_none_is_configured(
     health = await adapter_for(handler, environment, credential=None).health_check(environment)
 
     assert health.reachable is True
-    assert paths == ["/server_info"]
+    # No credential means no authenticated probe. ``/ready`` is unauthenticated
+    # and is still asked, so readiness can be reported separately from auth.
+    assert paths == ["/server_info", "/ready"]
+    assert health.credential_state is CredentialState.NOT_CONFIGURED
 
 
 async def test_health_check_reports_a_broken_credential_probe_as_unreachable(

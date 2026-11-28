@@ -37,3 +37,6 @@ Thumbs.db
 # Local environment configuration (copy from examples/, contains real hostnames)
 config/*.yaml
 !config/.gitkeep
+
+# Agent workspace memory (local only)
+.openhands/

@@ -60,6 +60,7 @@ environments:
     base_url: http://127.0.0.1:18000
     enabled: true
     request_timeout_seconds: 30
+    max_attempts: 3                    # 1 disables retries
     default_agent_profile_id: autonomous   # a profile NAME or UUID
     allowed_operations:
       - check_environment

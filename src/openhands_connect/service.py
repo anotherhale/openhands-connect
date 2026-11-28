@@ -19,7 +19,9 @@ from openhands_connect.domain.models import (
     Environment,
     EnvironmentId,
     HealthStatus,
+    MessageDelivery,
     Operation,
+    ProviderAmbiguousWrite,
     ProviderError,
     StopResult,
     Task,
@@ -101,9 +103,9 @@ class ConnectService:
 
     async def send_task_message(
         self, environment_id: EnvironmentId, task_id: TaskId, message: str
-    ) -> None:
+    ) -> MessageDelivery:
         environment = self._authorize(environment_id, Operation.SEND_TASK_MESSAGE)
-        await self._run(
+        return await self._run(
             environment,
             Operation.SEND_TASK_MESSAGE,
             lambda: self.provider.send_message(environment, task_id, message),
@@ -146,6 +148,19 @@ class ConnectService:
     ) -> _T:
         try:
             result = await action()
+        except ProviderAmbiguousWrite as exc:
+            # The write may or may not have landed, so the trail must not say
+            # "failed" — that is a claim the bridge cannot make.
+            self.audit.record(
+                AuditEvent(
+                    environment_id=environment.id,
+                    operation=operation,
+                    outcome=AuditOutcome.UNKNOWN,
+                    task_id=task_id,
+                    detail=exc.message,
+                )
+            )
+            raise
         except ProviderError as exc:
             self.audit.record(
                 AuditEvent(

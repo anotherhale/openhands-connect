@@ -48,6 +48,7 @@ class EnvironmentConfig(_ConfigModel):
         default_factory=list
     )
     request_timeout_seconds: float = Field(default=30.0, gt=0, le=600)
+    max_attempts: int = Field(default=3, ge=1, le=10)
     default_agent_profile_id: str | None = None
 
     @field_validator("credential_env_var")
@@ -80,6 +81,7 @@ class EnvironmentConfig(_ConfigModel):
                 allowed_operations=frozenset(allowed),
                 credential_env_var=self.credential_env_var,
                 request_timeout_seconds=self.request_timeout_seconds,
+                max_attempts=self.max_attempts,
                 default_agent_profile_id=self.default_agent_profile_id,
             )
         except ValidationError as exc:
