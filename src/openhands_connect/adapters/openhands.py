@@ -470,13 +470,19 @@ class OpenHandsAdapter:
             )
             started = await self._start_run(client, environment, task_id)
 
-        if started:
+        if started is True:
             detail = "message saved and the run started; poll get_task for progress"
-        else:
+        elif started is False:
             detail = (
                 "message saved but the run did not start because the server's run "
                 "capacity is full; the message is stored. Start it later by sending "
                 "another message, or retry after other runs finish."
+            )
+        else:
+            detail = (
+                "message saved, but whether the run started could not be confirmed "
+                "because the run request failed. The message is stored; check get_task "
+                "for progress before sending it again."
             )
         return MessageDelivery(
             task_id=task_id,
@@ -488,14 +494,18 @@ class OpenHandsAdapter:
 
     async def _start_run(
         self, client: httpx.AsyncClient, environment: Environment, task_id: TaskId
-    ) -> bool:
-        """Start the run, reporting a full-capacity 429 as "not started".
+    ) -> bool | None:
+        """Start the run, distinguishing refused / started / undetermined.
 
         ``POST /run`` is safe to repeat: a second call while already running
         answers 409, which means a run *is* in progress — i.e. started — so 409 is
-        accepted rather than raised. A 429 (run capacity full) is returned as
-        ``started=False`` rather than raised, because the message it follows is
-        already saved and the caller needs to know exactly that.
+        accepted rather than raised. A 429 (run capacity full) is a definite "did
+        not start" and returns ``False``.
+
+        Anything else — a 5xx, a timeout, or a lost response — cannot be shown
+        either way, so it returns ``None`` instead of raising. Raising here would
+        discard the fact that the message *was* already saved, and the caller
+        would retry the whole send, storing the message twice.
         """
         try:
             await self._send(
@@ -510,6 +520,8 @@ class OpenHandsAdapter:
             )
         except ProviderRateLimited:
             return False
+        except ProviderError:
+            return None
         return True
 
     async def stop_task(self, environment: Environment, task_id: TaskId) -> StopResult:

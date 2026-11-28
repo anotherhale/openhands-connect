@@ -207,6 +207,77 @@ async def test_ambiguous_write_is_reported_as_not_retryable(environment) -> None
     assert body["retryable"] is False
 
 
+async def test_saved_message_with_undetermined_run_is_not_reported_as_sent(environment) -> None:
+    """A stored message whose run is unknown must not read as delivered-and-running."""
+    server = build_server(
+        ConnectService(
+            registry=EnvironmentRegistry((environment,)),
+            provider=FakeProvider(message_started=None),
+            policy=PolicyEngine(),
+        )
+    )
+
+    result = await server.call_tool(
+        "send_task_message",
+        {"environment_id": "local", "task_id": "t1", "message": "hi"},
+    )
+    body = payload(result)
+
+    assert body["saved"] is True
+    assert body["started"] is None
+    assert body["sent"] is False
+    assert "unknown" in body["detail"]
+
+
+async def test_saved_message_with_started_run_is_reported_as_sent(environment) -> None:
+    """The honest states must not turn a real success into a maybe."""
+    server = build_server(
+        ConnectService(
+            registry=EnvironmentRegistry((environment,)),
+            provider=FakeProvider(message_started=True),
+            policy=PolicyEngine(),
+        )
+    )
+
+    result = await server.call_tool(
+        "send_task_message",
+        {"environment_id": "local", "task_id": "t1", "message": "hi"},
+    )
+    body = payload(result)
+
+    assert body["saved"] is True
+    assert body["started"] is True
+    assert body["sent"] is True
+
+
+async def test_ambiguous_write_is_audited_as_unknown_through_the_server(environment) -> None:
+    """The audit trail reached via a real tool call must not claim failure."""
+    from openhands_connect.domain.models import AuditOutcome
+    from openhands_connect.tests.conftest import RecordingAudit
+
+    audit = RecordingAudit()
+    server = build_server(
+        ConnectService(
+            registry=EnvironmentRegistry((environment,)),
+            provider=FakeProvider(
+                fail_with=ProviderAmbiguousWrite("may or may not have been applied")
+            ),
+            policy=PolicyEngine(),
+            audit=audit,
+        )
+    )
+
+    result = await server.call_tool(
+        "send_task_message",
+        {"environment_id": "local", "task_id": "t1", "message": "hi"},
+    )
+    body = payload(result)
+
+    assert body["error"] == "provider_ambiguous"
+    assert audit.events[-1].outcome is AuditOutcome.UNKNOWN
+    assert audit.events[-1].task_id == "t1"
+
+
 async def test_stop_task_reports_that_it_was_not_cancelled(server) -> None:
     result = await server.call_tool("stop_task", {"environment_id": "local", "task_id": "t1"})
     body = payload(result)

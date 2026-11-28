@@ -336,6 +336,10 @@ class AuditOutcome(StrEnum):
     DENIED = "denied"
     SUCCEEDED = "succeeded"
     FAILED = "failed"
+    #: The operation's effect could not be determined (an ambiguous write). Not
+    #: ``failed``: recording that would assert the write did not land when it may
+    #: have, and an operator reading the trail would draw the wrong conclusion.
+    UNKNOWN = "unknown"
 
 
 class AuditEvent(Frozen):

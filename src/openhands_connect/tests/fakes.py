@@ -115,12 +115,15 @@ class FakeProvider:
             environment_id=environment.id,
             saved=True,
             started=self.message_started,
-            detail=(
-                "fake delivery: message saved and the run started"
-                if self.message_started
-                else "fake delivery: message saved but the run did not start"
-            ),
+            detail=self._delivery_detail(),
         )
+
+    def _delivery_detail(self) -> str:
+        if self.message_started is True:
+            return "fake delivery: message saved and the run started"
+        if self.message_started is False:
+            return "fake delivery: message saved but the run did not start"
+        return "fake delivery: message saved but whether the run started is unknown"
 
     async def stop_task(self, environment: Environment, task_id: TaskId) -> StopResult:
         self._record("stop_task", environment)

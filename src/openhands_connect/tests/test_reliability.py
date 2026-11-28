@@ -21,10 +21,14 @@ from openhands_connect.adapters.openhands import (
     _backoff_delay,
     _retry_after_seconds,
 )
+from openhands_connect.audit import AuditSink
 from openhands_connect.domain.errors import InvalidInputError
 from openhands_connect.domain.models import (
+    AuditOutcome,
     Environment,
     ProviderAmbiguousWrite,
+    ProviderError,
+    ProviderErrorKind,
     ProviderInvalidRequest,
     ProviderRateLimited,
     ProviderTimeout,
@@ -32,7 +36,10 @@ from openhands_connect.domain.models import (
     ProviderUnavailable,
     TaskRequest,
 )
-from openhands_connect.tests.conftest import make_environment
+from openhands_connect.domain.registry import EnvironmentRegistry
+from openhands_connect.policy import PolicyEngine
+from openhands_connect.service import ConnectService
+from openhands_connect.tests.conftest import RecordingAudit, make_environment
 
 Handler = Any
 
@@ -46,6 +53,19 @@ def make_adapter(handler: Handler, credential: str | None = "secret-token") -> O
 
 def make_env(**overrides: Any) -> Environment:
     return make_environment(**overrides)
+
+
+def make_service(
+    adapter: OpenHandsAdapter, audit: AuditSink, environment: Environment | None = None
+) -> ConnectService:
+    """Build a real service around the adapter so audit wiring is exercised."""
+    env = environment or make_env()
+    return ConnectService(
+        registry=EnvironmentRegistry((env,)),
+        provider=adapter,
+        policy=PolicyEngine(),
+        audit=audit,
+    )
 
 
 @pytest.fixture
@@ -456,3 +476,172 @@ def test_retry_after_parses_seconds_and_ignores_dates() -> None:
     assert _retry_after_seconds(response({"retry-after": "2"})) == 2.0
     assert _retry_after_seconds(response({"retry-after": "Wed, 21 Oct 2015 07:28:00 GMT"})) is None
     assert _retry_after_seconds(response({})) is None
+
+
+# -- an undetermined run start must not hide a saved message ------------------
+
+
+async def test_run_step_failure_still_reports_the_message_was_saved() -> None:
+    """A saved message whose run failed must not be reported as a lost message.
+
+    ``MessageDelivery.saved`` documents "a rejected save never produces a
+    result". So once the save succeeds, *any* later failure has to come back as
+    a delivery with ``saved=True`` and ``started=None`` (could not be shown not
+    to have started). Raising instead would tell the caller nothing was stored,
+    and a retry would add the message a second time.
+    """
+    calls: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls.append(request.url.path)
+        if request.url.path.endswith("/events"):
+            return httpx.Response(201, json={"id": "evt-1"})
+        # Every attempt at the run fails with a non-retryable rejection.
+        return httpx.Response(500, json={"detail": "boom"})
+
+    delivery = await make_adapter(handler).send_message(make_env(), "t1", "hi")
+
+    assert delivery.saved is True
+    assert delivery.started is None
+    assert "saved" in delivery.detail
+    # The save happened exactly once: a retry would duplicate the message.
+    assert calls.count("/api/conversations/t1/events") == 1
+
+
+async def test_run_step_5xx_leaves_the_run_undetermined_not_failed() -> None:
+    """``POST /run`` returning 5xx cannot be read as "did not start"."""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path.endswith("/events"):
+            return httpx.Response(201, json={"id": "evt-1"})
+        return httpx.Response(503, json={"detail": "unavailable"})
+
+    delivery = await make_adapter(handler).send_message(make_env(max_attempts=1), "t1", "hi")
+
+    assert delivery.saved is True
+    assert delivery.started is None
+
+
+async def test_ambiguous_write_is_audited_as_unknown_not_failed() -> None:
+    """An unknown outcome must not be recorded as a definite failure.
+
+    ``ProviderAmbiguousWrite`` means the effect may or may not have been applied.
+    Auditing it as ``failed`` states something the bridge cannot know, and an
+    operator reading the trail would conclude the write never landed.
+    """
+
+    def handler(_request: httpx.Request) -> httpx.Response:
+        raise httpx.ReadTimeout("response lost")
+
+    audit = RecordingAudit()
+    service = make_service(make_adapter(handler), audit=audit)
+
+    with pytest.raises(ProviderAmbiguousWrite):
+        await service.send_task_message("local", "t1", "hi")
+
+    assert len(audit.events) == 1
+    assert audit.events[0].outcome is AuditOutcome.UNKNOWN
+    assert audit.events[0].task_id == "t1"
+
+
+async def test_a_definite_write_failure_is_still_audited_as_failed() -> None:
+    """The new outcome must not swallow genuine failures."""
+
+    def handler(_request: httpx.Request) -> httpx.Response:
+        return httpx.Response(422, json={"detail": [{"loc": ["body"], "msg": "bad"}]})
+
+    audit = RecordingAudit()
+    service = make_service(make_adapter(handler), audit=audit)
+
+    with pytest.raises(ProviderInvalidRequest):
+        await service.send_task_message("local", "t1", "hi")
+
+    assert audit.events[0].outcome is AuditOutcome.FAILED
+
+
+async def test_audit_detail_for_an_ambiguous_write_is_sanitized() -> None:
+    """The ambiguous message names the task id but never a credential."""
+
+    def handler(_request: httpx.Request) -> httpx.Response:
+        raise httpx.ReadTimeout("response lost for token=super-secret-value")
+
+    audit = RecordingAudit()
+    service = make_service(make_adapter(handler), audit=audit)
+
+    with pytest.raises(ProviderAmbiguousWrite):
+        await service.send_task_message("local", "t1", "hi")
+
+    detail = audit.events[0].detail or ""
+    assert "super-secret-value" not in detail
+
+
+# -- defensive parsing of upstream validation payloads -----------------------
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        pytest.param(b"<html>not json</html>", id="non-json"),
+        pytest.param({"detail": "just a string"}, id="detail-not-a-list"),
+        pytest.param({"detail": ["just a string"]}, id="detail-items-not-objects"),
+        pytest.param({"detail": [{"loc": "path.conversation_id"}]}, id="loc-not-a-list"),
+        pytest.param({"detail": [{"msg": "no loc at all"}]}, id="missing-loc"),
+        pytest.param({}, id="empty-object"),
+        pytest.param([{"loc": ["path", "conversation_id"]}], id="top-level-list"),
+    ],
+)
+async def test_unexpected_validation_payloads_do_not_crash_or_mislabel(payload) -> None:
+    """A 422 whose body is not FastAPI's usual shape must degrade, not crash.
+
+    Any of these could be produced by a proxy or a version change. The bridge
+    must not raise a parsing error of its own, and must not claim the task id
+    was malformed when the body does not actually say so.
+    """
+
+    def handler(_request: httpx.Request) -> httpx.Response:
+        if isinstance(payload, bytes):
+            return httpx.Response(422, content=payload)
+        return httpx.Response(422, json=payload)
+
+    with pytest.raises(ProviderInvalidRequest) as excinfo:
+        await make_adapter(handler).send_message(make_env(), "t1", "hi")
+
+    assert not isinstance(excinfo.value, InvalidInputError)
+    assert "not valid for environment" not in str(excinfo.value)
+
+
+async def test_a_non_json_success_body_is_a_protocol_error() -> None:
+    """An unparseable 200 is a protocol fault, never a silent empty task."""
+
+    def handler(_request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, content=b"<html>gateway</html>")
+
+    with pytest.raises(ProviderError) as excinfo:
+        await make_adapter(handler).get_task(make_env(), "t1")
+
+    assert excinfo.value.kind is ProviderErrorKind.PROTOCOL
+    assert "not JSON" in str(excinfo.value) or "non-JSON" in str(excinfo.value)
+
+
+async def test_a_json_array_success_body_is_a_protocol_error() -> None:
+    """A JSON array where an object is required is a protocol fault."""
+
+    def handler(_request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json=[1, 2, 3])
+
+    with pytest.raises(ProviderError) as excinfo:
+        await make_adapter(handler).get_task(make_env(), "t1")
+
+    assert excinfo.value.kind is ProviderErrorKind.PROTOCOL
+
+
+async def test_a_success_body_without_an_id_is_a_protocol_error() -> None:
+    """A conversation object with no id cannot be reported as a task."""
+
+    def handler(_request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json={"execution_status": "running"})
+
+    with pytest.raises(ProviderError) as excinfo:
+        await make_adapter(handler).get_task(make_env(), "t1")
+
+    assert excinfo.value.kind is ProviderErrorKind.PROTOCOL

@@ -21,6 +21,7 @@ from openhands_connect.domain.models import (
     HealthStatus,
     MessageDelivery,
     Operation,
+    ProviderAmbiguousWrite,
     ProviderError,
     StopResult,
     Task,
@@ -147,6 +148,19 @@ class ConnectService:
     ) -> _T:
         try:
             result = await action()
+        except ProviderAmbiguousWrite as exc:
+            # The write may or may not have landed, so the trail must not say
+            # "failed" — that is a claim the bridge cannot make.
+            self.audit.record(
+                AuditEvent(
+                    environment_id=environment.id,
+                    operation=operation,
+                    outcome=AuditOutcome.UNKNOWN,
+                    task_id=task_id,
+                    detail=exc.message,
+                )
+            )
+            raise
         except ProviderError as exc:
             self.audit.record(
                 AuditEvent(

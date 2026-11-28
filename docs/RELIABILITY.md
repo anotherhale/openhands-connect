@@ -75,6 +75,12 @@ adapter raises `ProviderAmbiguousWrite` instead, which:
 - says so in the message ("it may or may not have been applied … check that id
   before retrying").
 
+An ambiguous outcome is also recorded as `AuditOutcome.UNKNOWN` in the audit
+trail, never `FAILED`: writing `failed` would assert the write did not land when
+the bridge cannot know that, and an operator reading the trail would draw the
+wrong conclusion. A genuine rejection (4xx, or a connect failure that proves
+nothing was sent) is still `FAILED`.
+
 A **connect** failure is different: it proves the request never left, so it is an
 ordinary `ProviderUnavailable`, not an ambiguous one.
 
@@ -116,6 +122,13 @@ as unreachable.
   `MessageDelivery` reports `saved` and `started` separately; the tool layer's
   `sent` is true only when the run actually started, so a stored-but-idle message
   never reads as delivered.
+- **`started` has three values, not two.** `True` = run started (or already
+  running: `409`), `False` = run definitively refused (`429` capacity full), and
+  `None` = the run request failed in a way that cannot be shown either way (5xx,
+  timeout, lost response). `None` never raises: once the message is saved, the
+  fact that it is stored must survive a failing run step, or the caller would
+  resend the whole message and store it twice. `sent` is `false` for both `False`
+  and `None`.
 - **`stop_task` does not cancel.** Upstream has no terminate endpoint; `interrupt`
   and `pause` both leave the conversation `paused` and resumable. The result
   keeps `cancelled=false` and states that plainly.
@@ -145,6 +158,18 @@ real retry decisions (attempt counts, which statuses retry) without sleeping.
 
 Each new behaviour was mutation-checked: reverting it makes the corresponding
 test fail.
+
+Beyond the happy paths, the tests pin the honest-failure edges:
+
+- an ambiguous write is audited `UNKNOWN`, and a definite rejection is still
+  `FAILED` (both directions checked);
+- a saved message whose run step fails returns `started=None` and saves the
+  message exactly once — never a raised error that would invite a resend;
+- a 422 whose body is not FastAPI's usual shape (non-JSON, `detail` not a list,
+  `loc` missing or not a list, a top-level list) degrades to
+  `ProviderInvalidRequest` without mislabelling the task id;
+- a non-JSON or non-object 200, or one with no conversation id, is a
+  `ProviderProtocolError`, never a silently empty task.
 
 ## Not done here
 
