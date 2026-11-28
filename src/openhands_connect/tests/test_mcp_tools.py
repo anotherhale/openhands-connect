@@ -19,7 +19,9 @@ from openhands_connect.domain.models import (
     READ_OPERATIONS,
     CredentialState,
     Environment,
+    Operation,
     ProviderAmbiguousWrite,
+    ProviderKind,
     ProviderUnavailable,
     TaskLogEntry,
 )
@@ -27,7 +29,7 @@ from openhands_connect.domain.registry import EnvironmentRegistry
 from openhands_connect.mcp_server.server import build_server
 from openhands_connect.policy import PolicyEngine
 from openhands_connect.service import ConnectService
-from openhands_connect.tests.conftest import make_environment
+from openhands_connect.tests.conftest import RecordingAudit, make_environment
 from openhands_connect.tests.fakes import FakeProvider
 
 EXPECTED_TOOLS = {
@@ -93,6 +95,46 @@ async def test_list_environments_returns_sanitized_metadata(server) -> None:
     # The credential reference must not be exposed to a client.
     assert "credential_env_var" not in environment
     assert "OH_TEST_API_KEY" not in json.dumps(body)
+
+
+async def test_list_environments_never_leaks_a_password_in_the_base_url(
+    service: ConnectService,
+) -> None:
+    """``base_url`` is the newest outbound field, so it must pass the MCP boundary clean.
+
+    The ``Environment`` validator already refuses a credential-bearing URL, so
+    this uses ``model_construct`` to skip validation and prove the *second* line
+    of defence — redaction at the MCP boundary — also holds. Defence in depth is
+    the point: a value reaching an environment some other way must still not be
+    echoed to a client.
+    """
+    leaky = Environment.model_construct(
+        id="leaky",
+        name="Leaky",
+        provider=ProviderKind.OPENHANDS,
+        base_url="https://admin:s3cr3t-pw@agent.example.com:8443",
+        enabled=True,
+        allowed_operations=frozenset({Operation.CHECK_ENVIRONMENT}),
+        credential_env_var=None,
+        request_timeout_seconds=30.0,
+        max_attempts=3,
+        default_agent_profile_id=None,
+    )
+    built = build_server(
+        ConnectService(
+            registry=EnvironmentRegistry((leaky,)),
+            provider=FakeProvider(),
+            policy=PolicyEngine(),
+            audit=RecordingAudit(),
+        )
+    )
+
+    result = await built.call_tool("list_environments", {})
+    body = payload(result)
+
+    base_url = body["environments"][0]["base_url"]
+    assert "s3cr3t-pw" not in base_url
+    assert "agent.example.com" in base_url
 
 
 async def test_environment_id_is_required_for_execution(server) -> None:

@@ -114,3 +114,37 @@ def test_nested_mapping_values_are_redacted() -> None:
 def test_empty_input_is_safe() -> None:
     assert redact("") == ""
     assert Redactor().redact_mapping({"a": ""}) == {"a": ""}
+
+
+def test_url_userinfo_password_is_redacted() -> None:
+    """A password embedded in a URL must not survive to tool output.
+
+    ``list_environments`` returns ``base_url`` as a sanitized field, so a URL
+    carrying ``user:password@`` would leak a secret through a field the docs
+    describe as safe. ``base_url`` is the newest outbound text field, so it gets
+    this fail-before/pass-after test rather than trusting the config validator,
+    which is the first line of defence, not the last.
+    """
+    assert redact("base_url=https://user:hunter2@agent.example.com") != (
+        "base_url=https://user:hunter2@agent.example.com"
+    )
+    assert "hunter2" not in redact("https://admin:s3cr3t-pw@agent.example.com:8443/api")
+
+
+def test_url_userinfo_redaction_keeps_the_host_readable() -> None:
+    """Diagnostics must stay useful: the host identifies which environment failed."""
+    redacted = redact("https://admin:s3cr3t-pw@agent.example.com:8443/api")
+
+    assert "agent.example.com" in redacted
+    assert "admin" in redacted
+    assert "s3cr3t-pw" not in redacted
+
+
+def test_url_userinfo_redaction_does_not_touch_a_bare_host() -> None:
+    """No userinfo means nothing to redact; ordinary URLs must pass through."""
+    for text in (
+        "https://agent.example.com:8443/api",
+        "http://127.0.0.1:18000",
+        "see https://example.com/docs?page=2",
+    ):
+        assert redact(text) == text

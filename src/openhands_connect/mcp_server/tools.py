@@ -120,13 +120,18 @@ def _text_redactor(redactor: Redactor | None) -> Callable[[str | None], str | No
     return lambda text: None if text is None else active.redact(text)
 
 
-def environment_view(environment: Environment) -> dict[str, Any]:
-    """Sanitized view: never includes a credential value or its env var name."""
+def environment_view(environment: Environment, redactor: Redactor | None = None) -> dict[str, Any]:
+    """Sanitized view: never includes a credential value or its env var name.
+
+    ``base_url`` is passed through the redactor: a URL is data, not a literal
+    constant, and one carrying ``user:password@`` would otherwise leak a secret
+    through a field advertised as safe.
+    """
     return {
         "id": environment.id,
         "name": environment.name,
         "provider": environment.provider.value,
-        "base_url": environment.base_url,
+        "base_url": (redactor or Redactor()).redact(environment.base_url),
         "enabled": environment.enabled,
         "allowed_operations": sorted(op.value for op in environment.allowed_operations),
     }

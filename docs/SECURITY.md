@@ -31,6 +31,18 @@ Threats include prompt-injected instructions, unauthorized environment selection
 
 Configuration should contain credential references, not secrets. The first implementation should use environment variables or a local secure credential source appropriate to the runtime. Never echo credential values in diagnostics.
 
+Each environment resolves its own credential from its own variable. A missing token fails only that environment; it is never filled from another environment, and there is no fallback between environments.
+
+A credential embedded in a URL (`https://user:pass@host`) is refused at load time, and the configuration error shows only the scheme and host so the password is never echoed back. Redaction at the MCP boundary also strips URL userinfo as defence in depth, since `list_environments` returns `base_url`.
+
+## Transport
+
+A remote environment must use `https`. The credential travels in the `X-Session-API-Key` header on every request, so a plaintext remote endpoint would expose the token to anything on the path. `http` is permitted only for loopback hosts (`localhost`, `127.0.0.0/8`, `::1`), where the traffic does not leave the machine.
+
+Loopback detection parses the address rather than matching text, so a lookalike hostname such as `127.0.0.1.nip.io` or `localhost.attacker.example` does not inherit the exemption.
+
+This is enforced by the bridge on its own configuration. It is not a sandbox: the bridge cannot make the upstream server safer than it is, and cannot prevent an operator from reaching that server by other means.
+
 ## Logging
 
 Audit logs should prefer metadata (environment ID, task ID, action, result, timestamp) over raw task prompts or outputs. Any payload logging must be explicitly configured and redacted.
