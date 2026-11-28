@@ -88,10 +88,79 @@ token, and an unverified credential must never read as healthy. This is the
 ### `events/search` caps `limit` at 100
 
 A `limit` above `100` fails with `422` ("Input should be less than or equal to
-100"). The bridge bounds to 100 and advertises that maximum in the tool schema.
-The route sorts `TIMESTAMP` (oldest first) by default and pages forward with
-`next_page_id`; the bridge does not page, so a long run's logs are its opening
-events.
+100"); `limit=0` fails with `422` ("greater than 0"). The bridge bounds to 100
+and advertises that maximum in the tool schema.
+
+### `events/search` pagination: what is actually supported (verified)
+
+Probed against a live **Agent Server 1.60.1** on 2026-11-28 against a
+conversation holding 612 events. Every claim below is an observation, not an
+inference from a parameter name.
+
+**`sort_order=TIMESTAMP_DESC` genuinely works.** `EventSortOrder` is
+`{"TIMESTAMP", "TIMESTAMP_DESC"}`. With `TIMESTAMP_DESC` the first page starts at
+the newest event and each page is strictly older than the last. `TIMESTAMP`
+(oldest first) is the server default, which is why an unpaged read shows the
+opening of a run. An invalid value is a `422` naming both accepted values.
+
+**Backward paging via `next_page_id` is correct and lossless.** A full traversal
+of the 612-event conversation at `limit=100` took 7 pages, returned 612 events,
+and produced **612 unique ids — zero duplicates, zero skips**, matching
+`GET /events/count` exactly. Consecutive pages did not overlap, and each page was
+strictly older than the previous page's last entry.
+
+**`next_page_id` is an opaque token, not an event id.** It is UUID-shaped but is
+not any event id in the page it came from, so the bridge must treat it as opaque
+and must not parse or construct it.
+
+**A bad cursor is silently ignored — the server restarts at page 1.** Probed with
+three inputs: a non-UUID string, a well-formed but nonexistent UUID, and a cursor
+belonging to a *different* conversation. All three returned `HTTP 200` with a
+body byte-identical to page 1. There is **no error signal** for an invalid or
+cross-task cursor. A client that blindly reuses a stale or foreign cursor will
+loop over page 1 forever and never detect it. The bridge therefore owns cursor
+validation: it binds each cursor to the task and to the sort direction, and
+refuses a mismatch itself rather than trusting upstream to.
+
+**A cursor is not bound to the sort order.** Reusing a `TIMESTAMP_DESC` cursor
+with `sort_order=TIMESTAMP` returned `200` and 4 of 5 items overlapping the
+descending page — the token encodes a position, not a direction. Mixing
+directions mid-traversal silently corrupts a page. The bridge therefore pins the
+direction per traversal and encodes it in the cursor.
+
+**Timestamps are microsecond-resolution and were all distinct** across the 612
+events (612 distinct values, no ties). Ordering is therefore deterministic on
+`timestamp` alone in practice.
+
+**Ordering is *not* perfectly monotonic within a page.** One page of 100 held an
+event whose timestamp sat between its neighbours' (`…537684` after `…590859` in a
+`TIMESTAMP_DESC` page), and the raw upstream page showed the same inversion — it
+is the server's ordering, not the bridge's rendering. Two consequences, both
+load-bearing:
+
+* The bridge **preserves upstream order** rather than re-sorting. Sorting a page
+  would make its *last* item no longer the item upstream's cursor advances from,
+  so the next page could legitimately start above the sorted minimum and be
+  wrongly rejected as "not advanced".
+* The overlap guard therefore bounds on the page's **last timestamped item**,
+  which is exactly what `next_page_id` advances from — not on the page's min or
+  max. Bounding on an extreme stops a legitimate traversal early and silently
+  hides the rest of the history (covered by
+  `test_out_of_order_event_*_does_not_stop_the_traversal`).
+
+A full traversal is still lossless despite the inversion: 7 pages, 612 events,
+612 unique, **zero across-page inversions**.
+
+**Keyset alternative also works.** `timestamp__lt=<ts>` with
+`sort_order=TIMESTAMP_DESC` returned exactly the same page as `page_id` and also
+avoids overlap with the previous page. The bridge uses `next_page_id` (native,
+server-owned) and keeps the boundary timestamp only for an overlap guard, so a
+server that returned a stale page cannot duplicate entries silently.
+
+**Empty history** could not be produced live: all 100 conversations reachable on
+the test server had at least one event, so the empty-page shape is covered
+synthetically against the documented `{"items": [], "next_page_id": null}`
+envelope rather than by observation.
 
 ## Creating a conversation
 

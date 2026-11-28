@@ -27,6 +27,7 @@ from openhands_connect.domain.models import (
     CredentialState,
     Environment,
     HealthStatus,
+    LogSortOrder,
     MessageDelivery,
     ProviderAmbiguousWrite,
     ProviderError,
@@ -46,6 +47,7 @@ from openhands_connect.domain.models import (
     TaskResult,
     TaskState,
 )
+from openhands_connect.domain.pagination import decode_cursor, encode_cursor
 from openhands_connect.redaction import Redactor
 
 logger = logging.getLogger(__name__)
@@ -55,6 +57,10 @@ MAX_LOG_TEXT_CHARS = 2_000
 #: ``events/search`` rejects ``limit`` above 100 with a 422 (verified on
 #: Agent Server 1.60.1: "Input should be less than or equal to 100").
 MAX_LOG_ENTRIES = 100
+#: Hard cap on upstream requests for one tool call. A page normally needs one
+#: request; the extra allowance lets a page be assembled when upstream returns
+#: events the bridge cannot render, while still bounding total work.
+MAX_LOG_PAGES_PER_CALL = 3
 #: An authenticated route used to prove the credential is accepted.
 #: ``/server_info`` is unauthenticated and answers 200 even for a bad token.
 CREDENTIAL_PROBE_PATH = "/api/conversations/count"
@@ -354,37 +360,148 @@ class OpenHandsAdapter:
         return _task_from_payload(body, environment)
 
     async def get_task_logs(
-        self, environment: Environment, task_id: TaskId, *, limit: int = 50
+        self,
+        environment: Environment,
+        task_id: TaskId,
+        *,
+        limit: int = 50,
+        cursor: str | None = None,
+        sort_order: LogSortOrder | None = None,
     ) -> TaskLogs:
+        """Return one bounded page of a task's event log.
+
+        ``NEWEST_FIRST`` reads from the tail using upstream
+        ``sort_order=TIMESTAMP_DESC`` (verified on Agent Server 1.60.1), which is
+        what makes recent activity visible without walking the whole history.
+
+        A page is bounded twice: ``limit`` entries and at most
+        ``MAX_LOG_PAGES_PER_CALL`` upstream requests. Upstream can answer a bad
+        ``page_id`` with page 1 and ``200`` instead of an error, so the bridge
+        validates the cursor itself and additionally refuses to return a page
+        that overlaps the previous one, rather than silently duplicating entries
+        or looping.
+        """
         bounded = max(1, min(limit, MAX_LOG_ENTRIES))
-        async with self._calling(environment) as client:
-            response = await self._send(
-                client,
-                environment,
-                "GET",
-                f"/api/conversations/{task_id}/events/search",
-                idempotent=True,
-                task_id=task_id,
-                task_id_in_path=True,
-                params={"limit": bounded, "sort_order": "TIMESTAMP"},
+
+        if cursor is None:
+            order = sort_order or LogSortOrder.NEWEST_FIRST
+            upstream_page_id: str | None = None
+            boundary: str | None = None
+        else:
+            order, upstream_page_id, boundary = decode_cursor(
+                cursor, task_id=task_id, environment_id=environment.id
             )
-            body = _json_object(response, environment)
+            # An omitted sort_order takes the cursor's direction, so a caller can
+            # pass next_cursor back verbatim as the tool description promises.
+            if sort_order is not None and order is not sort_order:
+                raise InvalidInputError(
+                    "cursor was issued for "
+                    f"{order.value!r} ordering but {sort_order.value!r} was requested; "
+                    "keep sort_order consistent across pages of one traversal"
+                )
 
-        raw_items = body.get("items")
-        if not isinstance(raw_items, list):
-            raise ProviderProtocolError(f"upstream returned no event list for task {task_id!r}")
+        upstream_sort = "TIMESTAMP_DESC" if order is LogSortOrder.NEWEST_FIRST else "TIMESTAMP"
 
-        entries = tuple(
-            entry
-            for entry in (_log_entry(item, self._redactor_for(environment)) for item in raw_items)
-            if entry is not None
+        collected: list[TaskLogEntry] = []
+        pages_fetched = 0
+        page_id = upstream_page_id
+
+        async with self._calling(environment) as client:
+            while pages_fetched < MAX_LOG_PAGES_PER_CALL:
+                params: dict[str, str | int] = {
+                    "limit": bounded,
+                    "sort_order": upstream_sort,
+                }
+                if page_id is not None:
+                    params["page_id"] = page_id
+
+                response = await self._send(
+                    client,
+                    environment,
+                    "GET",
+                    f"/api/conversations/{task_id}/events/search",
+                    idempotent=True,
+                    task_id=task_id,
+                    task_id_in_path=True,
+                    params=params,
+                )
+                body = _json_object(response, environment)
+                pages_fetched += 1
+
+                raw_items = body.get("items")
+                if not isinstance(raw_items, list):
+                    raise ProviderProtocolError(
+                        f"upstream returned no event list for task {task_id!r}"
+                    )
+
+                redactor = self._redactor_for(environment)
+                page_entries = [
+                    entry
+                    for entry in (_log_entry(item, redactor) for item in raw_items)
+                    if entry is not None
+                ]
+
+                if boundary is not None:
+                    first_ts = _page_start(raw_items)
+                    # Upstream answers a stale or foreign page_id with page 1 and
+                    # 200. A page that is not strictly past the boundary means we
+                    # did not move, so stop rather than repeat entries forever.
+                    if first_ts is not None and _not_older(first_ts, boundary, order):
+                        logger.warning(
+                            "log pagination for task %s did not advance past %s; "
+                            "stopping instead of repeating entries",
+                            task_id,
+                            boundary,
+                        )
+                        page_id = None
+                        break
+
+                collected.extend(page_entries)
+
+                next_page_id = body.get("next_page_id")
+                if not isinstance(next_page_id, str) or not next_page_id:
+                    page_id = None
+                    break
+
+                # The next page must begin strictly past this page's last item.
+                # Without a boundary the following page could not be checked for
+                # a silent restart, so stop rather than risk repeating entries.
+                new_boundary = _page_boundary(raw_items)
+                if new_boundary is None:
+                    page_id = None
+                    break
+
+                page_id, boundary = next_page_id, new_boundary
+                if len(collected) >= bounded:
+                    break
+
+        entries = tuple(collected[:bounded])
+        # A page cap that stops the loop with a next page still available must
+        # still hand back a cursor: otherwise the caller is told the history
+        # ended when it merely paused.
+        next_cursor = (
+            encode_cursor(
+                task_id=task_id,
+                environment_id=environment.id,
+                sort_order=order,
+                upstream_page_id=page_id,
+                boundary=boundary,
+            )
+            if page_id is not None
+            else None
         )
+        # ``truncated``/``dropped_entries`` describe entries dropped from *this*
+        # page, not unread history; ``has_more`` says an older page exists.
+        dropped = len(collected) - len(entries)
         return TaskLogs(
             task_id=task_id,
             environment_id=environment.id,
-            entries=entries[:bounded],
-            truncated=len(entries) > bounded,
-            dropped_entries=max(0, len(entries) - bounded),
+            entries=entries,
+            truncated=dropped > 0,
+            dropped_entries=max(0, dropped),
+            next_cursor=next_cursor,
+            has_more=next_cursor is not None,
+            sort_order=order,
         )
 
     async def get_task_result(self, environment: Environment, task_id: TaskId) -> TaskResult:
@@ -839,6 +956,47 @@ def _timestamp(value: object) -> datetime | None:
         return datetime.fromisoformat(value.replace("Z", "+00:00"))
     except ValueError:
         return None
+
+
+def _not_older(candidate: str, boundary: str, order: LogSortOrder) -> bool:
+    """True when ``candidate`` has not moved past ``boundary`` in ``order``.
+
+    Timestamps arrive as fixed-width ISO-8601 with a microsecond fraction, so a
+    lexicographic comparison is chronological here. Newest-first means each page
+    must be strictly *older* than the last; oldest-first means strictly *newer*.
+    """
+    if order is LogSortOrder.NEWEST_FIRST:
+        return candidate >= boundary
+    return candidate <= boundary
+
+
+def _page_start(raw_items: list[Any]) -> str | None:
+    """The timestamp of the page's first timestamped item, or ``None``.
+
+    Read from the raw page rather than the rendered entries so that an event the
+    bridge cannot render cannot hide a restart: the overlap guard must compare
+    the same kind of item ``_page_boundary`` produced.
+    """
+    for item in raw_items:
+        if isinstance(item, dict) and isinstance(ts := item.get("timestamp"), str):
+            return ts
+    return None
+
+
+def _page_boundary(raw_items: list[Any]) -> str | None:
+    """The timestamp of the page's last timestamped item, or ``None``.
+
+    That item is what the upstream ``next_page_id`` advances from, so the next
+    page must begin strictly past it in the traversal's direction. Using an
+    extreme (``min``/``max``) instead is wrong: upstream ordering is not
+    perfectly monotonic — a page can hold an event whose timestamp sits between
+    its neighbours' (observed on 1.60.1) — and an extreme would then reject a
+    legitimate next page.
+    """
+    for item in reversed(raw_items):
+        if isinstance(item, dict) and isinstance(ts := item.get("timestamp"), str):
+            return ts
+    return None
 
 
 def _log_entry(item: object, redactor: Redactor) -> TaskLogEntry | None:

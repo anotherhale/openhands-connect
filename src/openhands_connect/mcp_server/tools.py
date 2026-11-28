@@ -21,6 +21,7 @@ from openhands_connect.domain.errors import (
 )
 from openhands_connect.domain.models import (
     Environment,
+    LogSortOrder,
     ProviderError,
     Task,
     TaskId,
@@ -28,6 +29,7 @@ from openhands_connect.domain.models import (
     TaskRequest,
     TaskResult,
 )
+from openhands_connect.domain.pagination import MAX_CURSOR_CHARS
 from openhands_connect.redaction import Redactor
 from openhands_connect.service import ConnectService
 
@@ -81,6 +83,31 @@ LimitArg = Annotated[
         description=f"Maximum number of log entries to return (1-{MAX_LOG_ENTRIES}).",
     ),
 ]
+CursorArg = Annotated[
+    str | None,
+    Field(
+        default=None,
+        max_length=MAX_CURSOR_CHARS,
+        description=(
+            "Opaque cursor from a previous get_task_logs result's next_cursor. "
+            "Pass it unchanged to fetch the next page; omit it to start from the "
+            "newest events. A cursor is only valid for the task and sort_order it "
+            "was issued for."
+        ),
+    ),
+]
+SortOrderArg = Annotated[
+    LogSortOrder | None,
+    Field(
+        default=None,
+        description=(
+            "Which end of the log to read: 'newest_first' (the default when "
+            "starting, showing recent activity) or 'oldest_first' (the opening "
+            "events). Omit it when continuing a traversal: the cursor carries its "
+            "own direction."
+        ),
+    ),
+]
 
 
 def _text_redactor(redactor: Redactor | None) -> Callable[[str | None], str | None]:
@@ -126,6 +153,9 @@ def logs_view(logs: TaskLogs, redactor: Redactor | None = None) -> dict[str, Any
         "environment_id": logs.environment_id,
         "truncated": logs.truncated,
         "dropped_entries": logs.dropped_entries,
+        "sort_order": logs.sort_order.value,
+        "next_cursor": logs.next_cursor,
+        "has_more": logs.has_more,
         "entries": [
             {
                 "timestamp": entry.timestamp,
@@ -264,9 +294,17 @@ class MCPTools:
         environment_id: EnvironmentIdArg,
         task_id: TaskIdArg,
         limit: LimitArg = 50,
+        cursor: CursorArg = None,
+        sort_order: SortOrderArg = None,
     ) -> dict[str, Any]:
         try:
-            logs = await self._service.get_task_logs(environment_id, task_id, limit=limit)
+            logs = await self._service.get_task_logs(
+                environment_id,
+                task_id,
+                limit=limit,
+                cursor=cursor,
+                sort_order=sort_order,
+            )
         except Exception as exc:
             return error_payload(exc)
         return logs_view(logs, self._redactor)

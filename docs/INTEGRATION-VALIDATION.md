@@ -223,9 +223,11 @@ health check cannot pass on an unverified credential.
   scope for v0.1 and not exercised.
 - **A full client-driven retry loop.** The `retryable` flag was checked; an
   actual retry-after-failure sequence was not driven through a client.
-- **Log paging.** `get_task_logs` returns the earliest events for a task, not the
-  newest: upstream `events/search` sorts ascending and pages forward with
-  `next_page_id`, which the bridge does not yet follow. Deferred to Issue #6.
+- **Log paging beyond one call.** `get_task_logs` reads newest-first and returns
+  a `next_cursor` for backward traversal, but nothing here drove a *client*
+  through a multi-call traversal: the adapter-level walk (612 events, 7 pages,
+  zero duplicates) was verified directly against the server, not through an MCP
+  client loop.
 
 ## Troubleshooting
 
@@ -243,12 +245,14 @@ health check cannot pass on an unverified credential.
 | `unknown_environment` | The `environment_id` is not in the config; the error lists the valid ones. |
 | `check_environment` says `reachable: true` but calls fail with 401 | Should not happen after the fix; if it does, the credential probe route changed upstream. |
 
-## Carried forward to Issue #6
+## Carried forward from this validation
 
-Concrete follow-ups from this validation, not addressed here:
+Concrete follow-ups from this validation:
 
-1. **Log paging.** Follow `next_page_id` from `events/search` with bounded page
-   sizes so callers can reach the newest events, not just the opening ones.
+1. ~~**Log paging.** Follow `next_page_id` from `events/search` with bounded page
+   sizes so callers can reach the newest events, not just the opening ones.~~
+   **Done** in Issue #12: `get_task_logs` reads newest-first and pages backward
+   with an opaque `cursor`, bounded per call.
 2. **`send_task_message` idempotency.** A blind client retry currently sends a
    second message. Either add an idempotency key or document a strict
    caller-supplied request-identity contract.

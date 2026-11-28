@@ -180,12 +180,31 @@ class TaskLogEntry(Frozen):
     text: str
 
 
+class LogSortOrder(StrEnum):
+    """Which end of a task's history a page is read from.
+
+    ``NEWEST_FIRST`` is the default because a long run's recent activity is
+    what a caller almost always wants, and reading from the oldest end hides it.
+    """
+
+    NEWEST_FIRST = "newest_first"
+    OLDEST_FIRST = "oldest_first"
+
+
 class TaskLogs(Frozen):
     task_id: TaskId
     environment_id: EnvironmentId
     entries: tuple[TaskLogEntry, ...]
     truncated: bool = False
     dropped_entries: int = 0
+    #: Opaque cursor for the next (older, for ``newest_first``) page, or ``None``
+    #: when the end of the history has been reached. Callers must treat it as a
+    #: black box: its shape is a bridge implementation detail and may change.
+    next_cursor: str | None = None
+    #: True when at least one older page exists. Derived from ``next_cursor`` so
+    #: a caller can loop without parsing the cursor.
+    has_more: bool = False
+    sort_order: LogSortOrder = LogSortOrder.NEWEST_FIRST
 
 
 class TaskResult(Frozen):
