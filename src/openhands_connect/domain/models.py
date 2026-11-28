@@ -195,6 +195,10 @@ class TaskLogs(Frozen):
     task_id: TaskId
     environment_id: EnvironmentId
     entries: tuple[TaskLogEntry, ...]
+    #: True only when entries were fetched but could not be returned *and* no
+    #: cursor can reach them. The bridge never advances past an entry it did not
+    #: return, so this stays False unless upstream breaks its own ``limit``
+    #: contract. Use ``has_more`` to learn that older history exists.
     truncated: bool = False
     dropped_entries: int = 0
     #: Opaque cursor for the next (older, for ``newest_first``) page, or ``None``

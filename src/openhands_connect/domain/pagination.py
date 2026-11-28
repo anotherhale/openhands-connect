@@ -26,8 +26,10 @@ from openhands_connect.domain.errors import InvalidInputError
 from openhands_connect.domain.models import LogSortOrder
 
 #: Bumped when the payload shape changes; an older cursor then fails validation
-#: instead of being misread under the new shape.
-CURSOR_VERSION = 1
+#: instead of being misread under the new shape. Version 2 added ``s``: a cursor
+#: from before that must not be read as "offset 0" by a bridge that knows better,
+#: because that is exactly the entry-dropping bug it fixes.
+CURSOR_VERSION = 2
 
 #: A real cursor is a small base64 blob. Bounding the length keeps a caller from
 #: forcing large decode work on every page.
@@ -41,6 +43,7 @@ def encode_cursor(
     sort_order: LogSortOrder,
     upstream_page_id: str,
     boundary: str | None = None,
+    skip: int = 0,
 ) -> str:
     """Wrap an upstream ``next_page_id`` in a bridge cursor.
 
@@ -49,6 +52,12 @@ def encode_cursor(
     travels in the cursor because upstream will happily answer a stale
     ``page_id`` with page 1 and ``200``; without the boundary the bridge cannot
     tell "next page" from "silently restarted at page 1".
+
+    ``skip`` is how many renderable entries at the *start* of the page named by
+    ``upstream_page_id`` were already returned to the caller. A single response
+    can stop partway through a fetched page when the page held more entries than
+    the response had room for, and the caller must resume at the remainder
+    rather than after it - otherwise those entries are never returned at all.
     """
     payload: dict[str, object] = {
         "v": CURSOR_VERSION,
@@ -59,19 +68,21 @@ def encode_cursor(
     }
     if boundary is not None:
         payload["b"] = boundary
+    if skip:
+        payload["s"] = skip
     raw = json.dumps(payload, separators=(",", ":"), sort_keys=True).encode()
     return base64.urlsafe_b64encode(raw).decode().rstrip("=")
 
 
 def decode_cursor(
     cursor: str, *, task_id: str, environment_id: str
-) -> tuple[LogSortOrder, str, str | None]:
-    """Validate a cursor and return its direction, upstream page id, and bound.
+) -> tuple[LogSortOrder, str, str | None, int]:
+    """Validate a cursor and return its direction, page id, bound, and skip.
 
     Rejects, as ``InvalidInputError``: an empty or over-long cursor, one that is
     not a well-formed envelope, one issued for a different task or environment,
-    and one from another cursor version. None of these can be left to upstream,
-    which would answer ``200`` with page 1.
+    one from another cursor version, and one with a nonsensical skip. None of
+    these can be left to upstream, which would answer ``200`` with page 1.
     """
     if not cursor:
         raise InvalidInputError("cursor is empty")
@@ -125,7 +136,13 @@ def decode_cursor(
     if boundary is not None and not isinstance(boundary, str):
         raise InvalidInputError("cursor has an invalid boundary")
 
-    return order, page_id, boundary
+    skip = payload.get("s", 0)
+    # ``bool`` is an ``int`` subclass, so exclude it explicitly: True would
+    # otherwise be accepted as a skip of 1.
+    if not isinstance(skip, int) or isinstance(skip, bool) or skip < 0:
+        raise InvalidInputError("cursor has an invalid resume position")
+
+    return order, page_id, boundary, skip
 
 
 __all__ = ["CURSOR_VERSION", "MAX_CURSOR_CHARS", "decode_cursor", "encode_cursor"]

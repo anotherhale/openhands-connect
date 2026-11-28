@@ -333,6 +333,14 @@ async def test_send_task_message_reports_a_stored_but_unstarted_message(
 
 
 async def test_logs_are_returned_with_truncation_flags(server, fake_provider) -> None:
+    """The tool layer must pass ``truncated``/``dropped_entries`` through verbatim.
+
+    Normal pagination drops nothing: entries beyond ``limit`` are reachable
+    through ``next_cursor``, so the flags stay false even though ``has_more`` is
+    true. They only turn true when the provider reports entries it could not
+    return *and* no cursor can reach, which is why the fake is told explicitly
+    rather than deriving them from ``log_entries`` and ``limit``.
+    """
     from openhands_connect.domain.models import TaskLogEntry
 
     fake_provider.log_entries = tuple(
@@ -346,6 +354,16 @@ async def test_logs_are_returned_with_truncation_flags(server, fake_provider) ->
     body = payload(result)
 
     assert len(body["entries"]) == 4
+    assert body["has_more"] is True
+    assert body["truncated"] is False
+    assert body["dropped_entries"] == 0
+
+    fake_provider.log_dropped_entries = 6
+    result = await server.call_tool(
+        "get_task_logs", {"environment_id": "local", "task_id": "t1", "limit": 4}
+    )
+    body = payload(result)
+
     assert body["truncated"] is True
     assert body["dropped_entries"] == 6
 

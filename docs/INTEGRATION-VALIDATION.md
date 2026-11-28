@@ -253,12 +253,32 @@ Concrete follow-ups from this validation:
    sizes so callers can reach the newest events, not just the opening ones.~~
    **Done** in Issue #12: `get_task_logs` reads newest-first and pages backward
    with an opaque `cursor`, bounded per call.
-2. **`send_task_message` idempotency.** A blind client retry currently sends a
+   **Remainder preservation** (follow-up on PR #13): when one response tops up
+   from a page that holds more entries than the response has room for, the
+   cursor now resumes *inside* that page (`skip` offset, pinned to the page's
+   last timestamp so a stale token is detectable) instead of advancing past it.
+   Before the fix, the fetched-but-unreturned tail of such a page was never
+   returned by any call. Verified live at `limit>=3` (612/612 unique) and by
+   unit tests covering two- and three-call drains of a single page, in both
+   directions.
+2. **Small-limit traversals stop early on a within-page timestamp inversion.**
+   Found while verifying #1 and **pre-existing, independent of #1**: on a live
+   612-event conversation, `limit` of 1, 2, or 4 returns only 4 (newest-first)
+   or 608 (oldest-first) entries instead of 612 and stops. Upstream can place an
+   item out of order *within* a page while its cursor still advances from the
+   page's last item, so a backward fetch can be handed a page whose first item
+   is newer than the boundary the guard compares against. The guard then treats
+   a legitimate page as a stale restart and stops. `limit>=5` and the default
+   are unaffected because page sizes rarely produce the inversion there. The
+   proper fix is to bind the overlap guard to the page *identity* upstream
+   advances from rather than to a timestamp comparison; that is a separate
+   change and is not part of PR #13.
+3. **`send_task_message` idempotency.** A blind client retry currently sends a
    second message. Either add an idempotency key or document a strict
    caller-supplied request-identity contract.
-3. **Live 429 / `waiting_for_confirmation` coverage.** Add opt-in live tests when
+4. **Live 429 / `waiting_for_confirmation` coverage.** Add opt-in live tests when
    the environment can reproduce them; keep the synthetic unit coverage until
    then.
-4. **Profile-name friction.** Consider a `list_agent_profiles` capability only if
+5. **Profile-name friction.** Consider a `list_agent_profiles` capability only if
    it fits the provider-neutral design without expanding the v0.1 surface
    (see the README limitation).

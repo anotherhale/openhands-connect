@@ -387,8 +387,9 @@ class OpenHandsAdapter:
             order = sort_order or LogSortOrder.NEWEST_FIRST
             upstream_page_id: str | None = None
             boundary: str | None = None
+            skip = 0
         else:
-            order, upstream_page_id, boundary = decode_cursor(
+            order, upstream_page_id, boundary, skip = decode_cursor(
                 cursor, task_id=task_id, environment_id=environment.id
             )
             # An omitted sort_order takes the cursor's direction, so a caller can
@@ -405,6 +406,15 @@ class OpenHandsAdapter:
         collected: list[TaskLogEntry] = []
         pages_fetched = 0
         page_id = upstream_page_id
+        #: True while the page about to be fetched must be entered partway
+        #: through, because the previous call already returned its first
+        #: ``skip`` renderable entries.
+        is_resume = skip > 0
+        #: Renderable entries the caller still has room for.
+        room = bounded
+        #: Entries this response could not hand back. Zero unless upstream
+        #: over-returns on a page the bridge cannot resume into.
+        dropped = 0
 
         async with self._calling(environment) as client:
             while pages_fetched < MAX_LOG_PAGES_PER_CALL:
@@ -441,7 +451,32 @@ class OpenHandsAdapter:
                     if entry is not None
                 ]
 
-                if boundary is not None:
+                if is_resume:
+                    # Resuming into a page the previous call already returned a
+                    # prefix of, so this page legitimately begins at or before the
+                    # boundary. What must hold is that it is the *same* page:
+                    # upstream answers a stale page_id with page 1, which would
+                    # otherwise hand back entries the caller already has.
+                    #
+                    # Identity is the page's *last* item, not its first. Upstream
+                    # ordering is not perfectly monotonic within a page, so the
+                    # first item of a resumed page can appear newer than the
+                    # boundary and a directional comparison would reject a
+                    # legitimate resume and silently hide the remainder.
+                    resumed_boundary = _page_boundary(raw_items)
+                    if boundary is None or resumed_boundary != boundary or skip > len(page_entries):
+                        logger.warning(
+                            "log pagination for task %s could not resume inside the "
+                            "expected page; stopping instead of repeating entries",
+                            task_id,
+                        )
+                        page_id = None
+                        break
+                    entered = skip
+                    page_entries = page_entries[skip:]
+                    is_resume = False
+
+                elif boundary is not None:
                     first_ts = _page_start(raw_items)
                     # Upstream answers a stale or foreign page_id with page 1 and
                     # 200. A page that is not strictly past the boundary means we
@@ -455,11 +490,40 @@ class OpenHandsAdapter:
                         )
                         page_id = None
                         break
+                    entered = 0
 
-                collected.extend(page_entries)
+                else:
+                    entered = 0
 
                 next_page_id = body.get("next_page_id")
-                if not isinstance(next_page_id, str) or not next_page_id:
+                has_next = isinstance(next_page_id, str) and bool(next_page_id)
+
+                taken = page_entries[:room]
+                collected.extend(taken)
+                room -= len(taken)
+                remaining = page_entries[len(taken) :]
+
+                if remaining:
+                    # The response is full but this page still holds entries the
+                    # caller has not seen. Resume inside this same page rather
+                    # than moving past it; advancing the cursor here is what used
+                    # to discard the tail of a page permanently. ``entered`` keeps
+                    # the offset cumulative across repeated resumes of one page.
+                    if page_id is None:
+                        # Unreachable while upstream honours ``limit`` (page one
+                        # cannot exceed it), but if it ever over-returns there is
+                        # no token to resume inside the page. Count the drop
+                        # rather than lose it silently.
+                        dropped = len(remaining)
+                        break
+                    skip = entered + len(taken)
+                    # The cursor's boundary now names the page being resumed into,
+                    # not the one before it, so the next call can confirm it got
+                    # the same page back before trusting ``skip``.
+                    boundary = _page_boundary(raw_items)
+                    break
+
+                if not has_next:
                     page_id = None
                     break
 
@@ -472,10 +536,11 @@ class OpenHandsAdapter:
                     break
 
                 page_id, boundary = next_page_id, new_boundary
-                if len(collected) >= bounded:
+                skip = 0
+                if room == 0:
                     break
 
-        entries = tuple(collected[:bounded])
+        entries = tuple(collected)
         # A page cap that stops the loop with a next page still available must
         # still hand back a cursor: otherwise the caller is told the history
         # ended when it merely paused.
@@ -486,19 +551,22 @@ class OpenHandsAdapter:
                 sort_order=order,
                 upstream_page_id=page_id,
                 boundary=boundary,
+                skip=skip,
             )
             if page_id is not None
             else None
         )
-        # ``truncated``/``dropped_entries`` describe entries dropped from *this*
-        # page, not unread history; ``has_more`` says an older page exists.
-        dropped = len(collected) - len(entries)
+        # Nothing is dropped on the normal path: entries beyond the response are
+        # reachable through the cursor. ``dropped`` is only non-zero in the
+        # defensive branch above, where upstream broke its own ``limit`` contract
+        # and no cursor could reach the remainder. ``truncated``/``dropped_entries``
+        # are kept for API compatibility.
         return TaskLogs(
             task_id=task_id,
             environment_id=environment.id,
             entries=entries,
             truncated=dropped > 0,
-            dropped_entries=max(0, dropped),
+            dropped_entries=dropped,
             next_cursor=next_cursor,
             has_more=next_cursor is not None,
             sort_order=order,
