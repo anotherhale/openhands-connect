@@ -2,22 +2,32 @@
 
 ## v0.1 — Safe functional bridge
 
-- [ ] Repository foundation and project documentation.
-- [ ] Runtime/language decision and ADR.
-- [ ] Configuration model for named environments.
-- [ ] Provider contract.
-- [ ] OpenHands adapter.
-- [ ] Environment listing and health tools.
-- [ ] Task creation, status, logs, messaging, cancellation.
-- [ ] Policy checks and audit events.
-- [ ] Mock-based contract and lifecycle tests.
-- [ ] Local setup and sanitized configuration examples.
+Delivered across PRs #4, #10, #11, #13 and #14.
+
+- [x] Repository foundation and project documentation.
+- [x] Runtime/language decision and ADR.
+- [x] Configuration model for named environments.
+- [x] Provider contract.
+- [x] OpenHands adapter.
+- [x] Environment listing and health tools.
+- [x] Task creation, status, logs, messaging, cancellation.
+- [x] Policy checks and audit events.
+- [x] Mock-based contract and lifecycle tests.
+- [x] Local setup and sanitized configuration examples.
 
 ## v0.2 — Remote connectivity
 
-- [ ] Validate supported remote OpenHands deployment patterns.
+- [x] Validate supported remote OpenHands deployment patterns.
+  An `https://` Agent Server is reachable directly; no relay is needed when it
+  is network-addressable from the client.
+- [x] Transport security: TLS required for any non-loopback `base_url`.
+- [x] Multiple named environments with per-environment credentials and no failover.
+- [x] Connection diagnostics and clearer failure classification.
+  A transport failure is reported as one of a fixed set of phrases (TLS
+  rejection, DNS failure, closed port, no response) instead of an exception
+  class name, so the caller learns the kind of failure without the raw upstream
+  text — which can contain a host or URL — reaching tool output.
 - [ ] Secure relay/tunnel design and implementation if needed.
-- [ ] Connection diagnostics and clearer failure classification.
 - [ ] Credential-provider abstraction.
 
 ## v0.3 — Client experience and customization

@@ -77,11 +77,41 @@ Notes:
 - **Credentials are never in this file.** An environment names the variable that
   holds its token (`credential_env_var: OH_STAGING_KEY`); the value is read at
   call time and never logged.
+- **A remote environment must use `https`.** The credential travels in the
+  `X-Session-API-Key` header on every request, so a plaintext remote would put a
+  token on the wire. `http` is accepted only for loopback hosts
+  (`localhost`, `127.0.0.0/8`, `::1`), which is how a local Agent Server is
+  normally started. Any other scheme, a URL with no host, and a URL with
+  credentials embedded (`https://user:pass@host`) are all rejected at load time.
 - **Operations are opt-in.** An environment that omits `allowed_operations`
   permits nothing beyond being listed.
 - `default_agent_profile_id` accepts a profile **name** (`autonomous`) or a
   **UUID**. A name is resolved through the server; an unknown name is reported
   with the list of available profiles rather than a bare 422.
+
+### Multiple environments
+
+Add more entries under `environments:`. Each is addressed by its own `id`, and
+there is no default and no failover:
+
+```yaml
+environments:
+  - id: local
+    name: Local Agent Server
+    base_url: http://127.0.0.1:18000        # loopback: plaintext is allowed
+    credential_env_var: OH_KEY_LOCAL
+    allowed_operations: [check_environment, create_task]
+  - id: staging
+    name: Staging
+    base_url: https://agent.staging.example.com   # remote: https required
+    credential_env_var: OH_KEY_STAGING
+    allowed_operations: [check_environment]       # read-only target
+```
+
+Each environment resolves its own credential from its own variable, so one
+missing token fails only that environment — it never falls back to another's.
+`list_environments` reports every configured target; `check_environment` reports
+reachability, readiness, and whether that environment's credential was accepted.
 
 Config is read from `OH_CONNECT_CONFIG` if set, else `config/environments.yaml`.
 
@@ -141,7 +171,11 @@ A local Agent Server authenticates with the `X-Session-API-Key` header, not
   pass the returned `next_cursor` back as `cursor` to walk further, and stop when
   `has_more` is false. Omit `sort_order` when continuing — the cursor carries its
   own direction.
-- Local server support only; cloud/relay is deferred.
+- **Remote environments are supported over HTTPS; a relay/tunnel is not.**
+  `https://` targets work directly. What v0.1 does not provide is a relay or
+  tunnel to reach a server that is not network-addressable from the client, nor
+  a hosted credential broker. There is also no failover: if a remote is down the
+  call fails, it never retries against another environment.
 - Single provider (`openhands`). The adapter boundary exists so others can be
   added.
 - **Agent profiles are referenced by name or ID, but cannot be listed.** There is

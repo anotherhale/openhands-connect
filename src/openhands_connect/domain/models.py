@@ -7,15 +7,47 @@ particular runtime.
 
 from __future__ import annotations
 
+import ipaddress
 import re
 from datetime import UTC, datetime
 from enum import StrEnum
 from typing import Annotated, Any, Literal
+from urllib.parse import urlsplit
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 ENVIRONMENT_ID_PATTERN = re.compile(r"^[a-z0-9][a-z0-9-]{0,62}$")
 """Environment IDs are user-facing, so they must be safe to echo in tool output."""
+
+_TLS_SCHEMES = frozenset({"https"})
+_PLAINTEXT_SCHEMES = frozenset({"http"})
+#: Exact loopback names only. A substring or prefix test would let
+#: ``localhost.attacker.example`` or ``127.0.0.1.nip.io`` inherit the exemption.
+_LOOPBACK_HOSTS = frozenset({"localhost", "::1", "0:0:0:0:0:0:0:1"})
+
+
+def is_loopback_host(host: str | None) -> bool:
+    """True only for an unambiguous loopback address.
+
+    ``127.0.0.0/8`` is loopback in its entirety; ``localhost`` and the IPv6
+    loopback literal are the other forms a development server is configured
+    with. Nothing else qualifies.
+
+    The address is parsed, not pattern-matched: a prefix test would exempt
+    ``127.0.0.1.nip.io`` (a real public hostname that resolves to an attacker's
+    machine) and any other name merely starting with a loopback address.
+    """
+    if not host:
+        return False
+    normalised = host.strip("[]").lower()
+    if normalised in _LOOPBACK_HOSTS:
+        return True
+    try:
+        address = ipaddress.ip_address(normalised)
+    except ValueError:
+        return False
+    return address.is_loopback
+
 
 TASK_ID_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")
 
@@ -105,8 +137,58 @@ class Environment(Frozen):
 
     @field_validator("base_url")
     @classmethod
-    def _strip_trailing_slash(cls, value: str) -> str:
-        return value.rstrip("/")
+    def _validate_transport(cls, value: str) -> str:
+        """Require TLS for anything that is not loopback.
+
+        The credential travels in the ``X-Session-API-Key`` header on every
+        request, so a plaintext remote would put a token on the wire. Loopback
+        keeps HTTP because that is how a local development server is normally
+        started and the traffic does not leave the machine.
+        """
+        stripped = value.rstrip("/")
+        try:
+            parts = urlsplit(stripped)
+        except ValueError:
+            # A malformed IPv6 literal raises here. Today's message is just
+            # "Invalid IPv6 URL", but its text is an stdlib implementation
+            # detail that is not contracted to stay free of the input, so the
+            # parser's message is replaced with our own rather than propagated.
+            raise ValueError(
+                "base_url is not a valid URL; expected https://host[:port] "
+                "(or http://127.0.0.1:port for a local server)"
+            ) from None
+        scheme = parts.scheme.lower()
+        # Echo the URL without userinfo: base_url is repeated in the error text,
+        # which reaches tool output, and a password embedded in a URL must never
+        # be reflected.
+        shown = f"{scheme}://{parts.hostname}"
+
+        if parts.username is not None or parts.password is not None:
+            raise ValueError(
+                f"base_url {shown!r} embeds credentials in the URL. Credentials "
+                "must never appear in configuration: remove them and name an "
+                "environment variable in credential_env_var instead"
+            )
+        if not scheme or not parts.netloc:
+            raise ValueError(
+                "base_url is not an absolute URL; expected https://host[:port] "
+                "(or http://127.0.0.1:port for a local server)"
+            )
+        if scheme not in _TLS_SCHEMES | _PLAINTEXT_SCHEMES:
+            raise ValueError(
+                f"base_url uses unsupported scheme {scheme!r}; only https (or http "
+                "for a loopback address) is supported"
+            )
+        if scheme in _TLS_SCHEMES:
+            return stripped
+        if is_loopback_host(parts.hostname):
+            return stripped
+        raise ValueError(
+            f"base_url {shown!r} is a remote environment over plaintext http. "
+            "A credential would be sent unencrypted: use https:// for remote "
+            "environments (http is allowed only for loopback hosts, e.g. "
+            "http://127.0.0.1:18000)"
+        )
 
     def permits(self, operation: Operation) -> bool:
         return self.enabled and operation in self.allowed_operations

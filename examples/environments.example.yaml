@@ -34,6 +34,10 @@ environments:
 
   # A remote, authenticated server. The token lives in OH_STAGING_KEY and is
   # never stored in this file.
+  #
+  # `https` is REQUIRED here: the token travels in the X-Session-API-Key header
+  # on every request, so a plaintext remote would send it in the clear. `http`
+  # is accepted only for loopback hosts (127.0.0.1, localhost, ::1).
   - id: staging
     name: Staging Agent Server
     provider: openhands

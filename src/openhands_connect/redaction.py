@@ -45,6 +45,14 @@ _SECRET_PATTERNS: tuple[tuple[re.Pattern[str], str], ...] = (
     (re.compile(r"\bxox[abprs]-[A-Za-z0-9-]{10,}\b"), REDACTED),
 )
 
+#: Credentials embedded in a URL's userinfo (``https://user:password@host``).
+#: No other pattern covers this shape: there is no ``name=value`` pair and no
+#: recognisable token prefix. ``list_environments`` returns ``base_url`` as a
+#: field documented as sanitized, so a URL in a diagnostic must not carry a
+#: password through it. The user and host are kept — they are what makes the
+#: message useful.
+_URL_USERINFO = re.compile(r"(?i)\b([a-z][a-z0-9+.\-]*://[^\s:/@]+):([^\s/?#@]+)@")
+
 
 def _redact_header(match: re.Match[str]) -> str:
     name, separator, scheme, value = match.groups()
@@ -89,6 +97,7 @@ class Redactor:
                 result = result.replace(secret, REDACTED)
         result = _HEADER_PATTERN.sub(_redact_header, result)
         result = _SECRET_ASSIGNMENT.sub(_redact_secret_assignment, result)
+        result = _URL_USERINFO.sub(rf"\1:{REDACTED}@", result)
         for pattern, replacement in _SECRET_PATTERNS:
             result = pattern.sub(replacement, result)
         return result

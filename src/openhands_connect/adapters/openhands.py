@@ -1178,10 +1178,77 @@ def _credential_failure_detail(state: CredentialState) -> str:
     )
 
 
+#: Fixed phrases for a connection failure. An operator configuring a remote
+#: environment needs to tell a TLS rejection from a DNS failure from a closed
+#: port — all three arrive as ``ConnectError``. The phrase is chosen by matching
+#: the underlying text but only the constant is reported, so a hostname or URL
+#: in the original message cannot reach a caller.
+#:
+#: Each phrase is deliberately worded differently from the upstream text it
+#: recognises. Reusing the upstream wording would defeat the tests that assert
+#: raw provider text never appears in a message.
+_CONNECT_FAILURE_KINDS: tuple[tuple[tuple[str, ...], str], ...] = (
+    (
+        (
+            "certificate",
+            "ssl",
+            "tls",
+            "cert_verify",
+            "self-signed",
+            "unknown ca",
+            "wrong version number",
+        ),
+        "the TLS handshake failed (check the certificate and that the port really serves HTTPS)",
+    ),
+    (
+        (
+            "nodename nor servname",
+            "name or service not known",
+            "temporary failure in name resolution",
+            "getaddrinfo",
+            "no address associated",
+        ),
+        "the hostname could not be resolved (check the name and DNS)",
+    ),
+    (
+        ("connection refused", "errno 61", "errno 111"),
+        "nothing is listening on that host and port (check that the server is "
+        "running and the port is right)",
+    ),
+    (
+        ("network is unreachable", "no route to host", "errno 51", "errno 113"),
+        "the host is not reachable from this machine (check network and routing)",
+    ),
+)
+
+#: Phrases safe to repeat verbatim in front of a caller. Each is constant, so
+#: nothing from the underlying exception is echoed.
+_SAFE_EXCEPTION_NAMES = frozenset(
+    {
+        "ConnectError",
+        "ConnectTimeout",
+        "ReadTimeout",
+        "WriteTimeout",
+        "PoolTimeout",
+        "ReadError",
+        "WriteError",
+        "RemoteProtocolError",
+        "ProxyError",
+        "UnsupportedProtocol",
+    }
+)
+
+
 def _transport_detail(exc: httpx.HTTPError) -> str:
     if isinstance(exc, httpx.TimeoutException):
         return "request timed out"
-    return f"connection failed: {type(exc).__name__}"
+    raw = str(exc).lower()
+    for needles, phrase in _CONNECT_FAILURE_KINDS:
+        if any(needle in raw for needle in needles):
+            return phrase
+    name = type(exc).__name__
+    safe_name = name if name in _SAFE_EXCEPTION_NAMES else "transport error"
+    return f"connection failed: {safe_name}"
 
 
 def _retry_after_seconds(response: httpx.Response) -> float | None:
