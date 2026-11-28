@@ -79,7 +79,7 @@ params = StdioServerParameters(
 async with stdio_client(params) as (read, write):
     async with ClientSession(read, write) as session:
         await session.initialize()
-        tools = await session.list_tools()          # 8 tools
+        tools = await session.list_tools()  # 8 tools
         await session.call_tool("check_environment", {"environment_id": "local"})
 ```
 
