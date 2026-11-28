@@ -13,11 +13,13 @@ from typing import Any
 from mcp.server.mcpserver import MCPServer
 
 from openhands_connect.mcp_server.tools import (
+    CursorArg,
     EnvironmentIdArg,
     LimitArg,
     MCPTools,
     MessageArg,
     PromptArg,
+    SortOrderArg,
     TaskIdArg,
 )
 from openhands_connect.service import ConnectService
@@ -121,15 +123,32 @@ def build_server(service: ConnectService) -> MCPServer:
     @server.tool(
         name="get_task_logs",
         description=(
-            "Retrieve a bounded, redacted slice of a task's event log from ONE named "
-            "environment. Returns at most 'limit' entries (default 50, max 200); each "
-            "entry's text is truncated and credential-like strings are redacted."
+            "Retrieve a bounded, redacted page of a task's event log from ONE named "
+            "environment. Returns at most 'limit' entries (default 50, max 100). "
+            "Reads the newest events first by default, so recent activity is visible "
+            "without walking the whole history; pass sort_order='oldest_first' for "
+            "the opening events. Each entry's text is truncated and credential-like "
+            "strings are redacted. When 'has_more' is true, pass 'next_cursor' back "
+            "unchanged as 'cursor' to fetch the next page, and leave 'sort_order' "
+            "out on those continuation calls: the cursor carries its own direction, "
+            "so passing a different one is rejected rather than silently returning "
+            "overlapping pages."
         ),
     )
     async def get_task_logs(
-        environment_id: EnvironmentIdArg, task_id: TaskIdArg, limit: LimitArg = 50
+        environment_id: EnvironmentIdArg,
+        task_id: TaskIdArg,
+        limit: LimitArg = 50,
+        cursor: CursorArg = None,
+        sort_order: SortOrderArg = None,
     ) -> dict[str, Any]:
-        return await tools.get_task_logs(environment_id, task_id, limit=limit)
+        return await tools.get_task_logs(
+            environment_id,
+            task_id,
+            limit=limit,
+            cursor=cursor,
+            sort_order=sort_order,
+        )
 
     @server.tool(
         name="send_task_message",

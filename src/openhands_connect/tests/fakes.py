@@ -12,6 +12,7 @@ from openhands_connect.domain.models import (
     CredentialState,
     Environment,
     HealthStatus,
+    LogSortOrder,
     MessageDelivery,
     ProviderNotFound,
     ProviderUnavailable,
@@ -41,11 +42,17 @@ class FakeProvider:
     task_title: str = "fake task"
     task_detail: str | None = None
     log_entries: tuple[TaskLogEntry, ...] = ()
+    #: Entries this fake reports as fetched-but-unreturned with no cursor able to
+    #: reach them. The real adapter only sets this if upstream breaks its own
+    #: ``limit`` contract, so tests of the tool layer set it explicitly rather
+    #: than inferring it from ``log_entries`` and ``limit``.
+    log_dropped_entries: int = 0
     message_started: bool | None = True
     fail_with: Exception | None = None
     calls: list[tuple[str, str]] = field(default_factory=list)
     created_requests: list[TaskRequest] = field(default_factory=list)
     sent_messages: list[tuple[str, str]] = field(default_factory=list)
+    log_calls: list[dict[str, object]] = field(default_factory=list)
     closed: bool = False
 
     def _record(self, operation: str, environment: Environment) -> None:
@@ -82,16 +89,32 @@ class FakeProvider:
         return self._task(environment, task_id)
 
     async def get_task_logs(
-        self, environment: Environment, task_id: TaskId, *, limit: int = 50
+        self,
+        environment: Environment,
+        task_id: TaskId,
+        *,
+        limit: int = 50,
+        cursor: str | None = None,
+        sort_order: LogSortOrder | None = None,
     ) -> TaskLogs:
         self._record("get_task_logs", environment)
-        entries = self.log_entries[:limit]
+        self.log_calls.append({"limit": limit, "cursor": cursor, "sort_order": sort_order})
+        effective = sort_order or LogSortOrder.NEWEST_FIRST
+        if effective is LogSortOrder.NEWEST_FIRST:
+            ordered = list(reversed(self.log_entries))
+        else:
+            ordered = list(self.log_entries)
+        entries = tuple(ordered[:limit])
+        dropped = min(self.log_dropped_entries, max(0, len(ordered) - limit))
         return TaskLogs(
             task_id=task_id,
             environment_id=environment.id,
             entries=entries,
-            truncated=len(self.log_entries) > limit,
-            dropped_entries=max(0, len(self.log_entries) - limit),
+            truncated=dropped > 0,
+            dropped_entries=dropped,
+            next_cursor=f"cursor-{limit}" if len(ordered) > limit else None,
+            has_more=len(ordered) > limit,
+            sort_order=effective,
         )
 
     async def get_task_result(self, environment: Environment, task_id: TaskId) -> TaskResult:

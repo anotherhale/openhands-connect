@@ -19,6 +19,7 @@ from openhands_connect.domain.models import (
     Environment,
     EnvironmentId,
     HealthStatus,
+    LogSortOrder,
     MessageDelivery,
     Operation,
     ProviderAmbiguousWrite,
@@ -72,13 +73,25 @@ class ConnectService:
         )
 
     async def get_task_logs(
-        self, environment_id: EnvironmentId, task_id: TaskId, *, limit: int = 50
+        self,
+        environment_id: EnvironmentId,
+        task_id: TaskId,
+        *,
+        limit: int = 50,
+        cursor: str | None = None,
+        sort_order: LogSortOrder | None = None,
     ) -> TaskLogs:
         environment = self._authorize(environment_id, Operation.GET_TASK_LOGS)
         return await self._run(
             environment,
             Operation.GET_TASK_LOGS,
-            lambda: self.provider.get_task_logs(environment, task_id, limit=limit),
+            lambda: self.provider.get_task_logs(
+                environment,
+                task_id,
+                limit=limit,
+                cursor=cursor,
+                sort_order=sort_order,
+            ),
             task_id=task_id,
         )
 

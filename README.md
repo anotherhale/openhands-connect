@@ -20,7 +20,7 @@ bounded logs, follow-up messages, and stop.
 | `check_environment` | Reachability **and** credential check for one environment ID (reports `credential_state`) |
 | `create_task` | Submit a prompt; returns a task ID |
 | `get_task` | Normalized status |
-| `get_task_logs` | Bounded, redacted log entries (max 100) |
+| `get_task_logs` | Bounded, redacted log entries, newest first; page back with `cursor` (max 100/page) |
 | `send_task_message` | Follow-up instruction to a running or paused task |
 | `stop_task` | Interrupt/pause — see *Limitations* |
 | `get_task_result` | Completion summary when available |
@@ -133,18 +133,21 @@ A local Agent Server authenticates with the `X-Session-API-Key` header, not
   `interrupt`, which pauses; it reports `cancelled=False` rather than claiming a
   cancellation the server cannot perform. A paused task stays resumable —
   `send_task_message` continues the same conversation.
-- **`get_task_logs` returns at most 100 entries.** Upstream rejects a larger
-  `limit` with a 422. Larger values are clamped, not rejected.
-- **Logs are the oldest events in the conversation, not the newest.** The
-  upstream `events/search` route pages forward from the beginning, so a long run
-  shows its opening events rather than its tail.
+- **`get_task_logs` returns at most 100 entries per page.** Upstream rejects a
+  larger `limit` with a 422. Larger values are clamped, not rejected.
+- **Logs are read newest-first by default**, so an unpaged call shows a run's
+  recent activity rather than its opening events. `sort_order="oldest_first"`
+  reads from the other end. Either way, a long run is read a page at a time:
+  pass the returned `next_cursor` back as `cursor` to walk further, and stop when
+  `has_more` is false. Omit `sort_order` when continuing — the cursor carries its
+  own direction.
 - Local server support only; cloud/relay is deferred.
 - Single provider (`openhands`). The adapter boundary exists so others can be
   added.
 - **Agent profiles are referenced by name or ID, but cannot be listed.** There is
   no `list_agent_profiles` tool in v0.1: discovering a profile name is a
   configuration step done against the server directly. Adding one is tracked for
-  Issue #6 and deliberately not part of this surface yet.
+  a future issue and deliberately not part of this surface yet.
 - **An earlier hang is not explained.** Some conversations previously hung
   instead of replying to a PING. Controlled runs during validation completed
   normally, but the cause was not identified and the symptom may recur — see

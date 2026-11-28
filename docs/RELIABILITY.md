@@ -173,8 +173,10 @@ Beyond the happy paths, the tests pin the honest-failure edges:
 
 ## Not done here
 
-- **Log paging.** `get_task_logs` still returns the earliest events, not the
-  newest (upstream sorts ascending and pages forward). Tracked separately.
+- **Log paging beyond one call.** `get_task_logs` reads newest-first and returns
+  a `next_cursor` for backward traversal; a full adapter-level walk of a
+  612-event conversation was verified lossless, but a client-driven multi-call
+  loop was not.
 - **`waiting_for_confirmation`.** Mapped from the OpenAPI enum, never observed
   live.
 - **Live 429 / ambiguous-write coverage.** Reproduced synthetically; not driven

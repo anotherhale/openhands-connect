@@ -333,6 +333,14 @@ async def test_send_task_message_reports_a_stored_but_unstarted_message(
 
 
 async def test_logs_are_returned_with_truncation_flags(server, fake_provider) -> None:
+    """The tool layer must pass ``truncated``/``dropped_entries`` through verbatim.
+
+    Normal pagination drops nothing: entries beyond ``limit`` are reachable
+    through ``next_cursor``, so the flags stay false even though ``has_more`` is
+    true. They only turn true when the provider reports entries it could not
+    return *and* no cursor can reach, which is why the fake is told explicitly
+    rather than deriving them from ``log_entries`` and ``limit``.
+    """
     from openhands_connect.domain.models import TaskLogEntry
 
     fake_provider.log_entries = tuple(
@@ -346,6 +354,16 @@ async def test_logs_are_returned_with_truncation_flags(server, fake_provider) ->
     body = payload(result)
 
     assert len(body["entries"]) == 4
+    assert body["has_more"] is True
+    assert body["truncated"] is False
+    assert body["dropped_entries"] == 0
+
+    fake_provider.log_dropped_entries = 6
+    result = await server.call_tool(
+        "get_task_logs", {"environment_id": "local", "task_id": "t1", "limit": 4}
+    )
+    body = payload(result)
+
     assert body["truncated"] is True
     assert body["dropped_entries"] == 6
 
@@ -563,3 +581,60 @@ async def test_check_environment_reports_the_credential_state(
 
     assert body["reachable"] is False
     assert body["credential_state"] == "rejected"
+
+
+# -- log pagination through the tool surface --------------------------------
+
+
+async def test_logs_default_to_newest_first_and_advertise_continuation(
+    server, fake_provider
+) -> None:
+    """An unpaged read must surface recent activity and say how to continue."""
+    fake_provider.log_entries = tuple(
+        TaskLogEntry(kind="MessageEvent", text=f"entry {index}", source="agent")
+        for index in range(10)
+    )
+
+    body = payload(
+        await server.call_tool(
+            "get_task_logs", {"environment_id": "local", "task_id": "t1", "limit": 4}
+        )
+    )
+
+    assert body["sort_order"] == "newest_first"
+    assert body["entries"][0]["text"] == "entry 9"
+    assert body["has_more"] is True
+    assert body["next_cursor"] is not None
+    assert fake_provider.log_calls[-1]["sort_order"] is None
+
+
+async def test_log_cursor_is_passed_through_to_the_provider(server, fake_provider) -> None:
+    """A cursor the tool returns must reach the provider unchanged."""
+    fake_provider.log_entries = tuple(
+        TaskLogEntry(kind="MessageEvent", text=f"entry {index}", source="agent")
+        for index in range(10)
+    )
+
+    first = payload(
+        await server.call_tool(
+            "get_task_logs", {"environment_id": "local", "task_id": "t1", "limit": 4}
+        )
+    )
+    await server.call_tool(
+        "get_task_logs",
+        {"environment_id": "local", "task_id": "t1", "limit": 4, "cursor": first["next_cursor"]},
+    )
+
+    assert fake_provider.log_calls[-1]["cursor"] == first["next_cursor"]
+
+
+async def test_log_sort_order_is_advertised_in_the_schema(server) -> None:
+    by_name = {tool.name: tool for tool in await server.list_tools()}
+    props = by_name["get_task_logs"].input_schema["properties"]
+
+    assert "cursor" in props
+    assert "sort_order" in props
+    # Nullable and optional so a continuation can omit it and inherit the
+    # cursor's direction instead of silently flipping it.
+    assert {"type": "null"} in props["sort_order"]["anyOf"]
+    assert "cursor" in props["sort_order"]["description"]
