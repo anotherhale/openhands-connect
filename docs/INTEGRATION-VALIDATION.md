@@ -261,18 +261,13 @@ Concrete follow-ups from this validation:
    returned by any call. Verified live at `limit>=3` (612/612 unique) and by
    unit tests covering two- and three-call drains of a single page, in both
    directions.
-2. **Small-limit traversals stop early on a within-page timestamp inversion.**
-   Found while verifying #1 and **pre-existing, independent of #1**: on a live
-   612-event conversation, `limit` of 1, 2, or 4 returns only 4 (newest-first)
-   or 608 (oldest-first) entries instead of 612 and stops. Upstream can place an
-   item out of order *within* a page while its cursor still advances from the
-   page's last item, so a backward fetch can be handed a page whose first item
-   is newer than the boundary the guard compares against. The guard then treats
-   a legitimate page as a stale restart and stops. `limit>=5` and the default
-   are unaffected because page sizes rarely produce the inversion there. The
-   proper fix is to bind the overlap guard to the page *identity* upstream
-   advances from rather than to a timestamp comparison; that is a separate
-   change and is not part of PR #13.
+2. ~~**Small-limit traversals stop early on a within-page timestamp inversion.**~~
+   **Fixed** in Issue #14. On a live 612-event conversation, `limit` of 1, 2, or 4
+   returned only 4 (newest-first) or 608 (oldest-first) entries instead of 612 and
+   stopped. Upstream can place an item out of order *within* a page while its
+   cursor still advances from the page's last item, so a backward fetch was handed
+   a page whose first item was newer than the boundary the guard compared against,
+   and the guard called a legitimate page a stale restart.
 3. **`send_task_message` idempotency.** A blind client retry currently sends a
    second message. Either add an idempotency key or document a strict
    caller-supplied request-identity contract.
@@ -282,3 +277,47 @@ Concrete follow-ups from this validation:
 5. **Profile-name friction.** Consider a `list_agent_profiles` capability only if
    it fits the provider-neutral design without expanding the v0.1 surface
    (see the README limitation).
+
+## Issue #14 — small-limit pagination fix (verified live, 1.60.1)
+
+**Root cause.** Upstream's `next_page_id` is the *event id of the next page's first
+item* — an inclusive identity token, not a timestamp. Verified on a live server
+across `limit ∈ {1,2,3,4,5,7}` × both sort orders: 192/192 pages began with exactly
+the id the request's `page_id` named. Invalid or foreign tokens are answered
+silently with page 1 and `200`. The adapter had instead guarded continuations by
+comparing timestamps (`_not_older` / `_page_start` / `_page_boundary`), which fails
+whenever upstream emits non-monotonic timestamps across a page boundary: tiny pages
+produce such an inversion constantly, so the guard declared a legitimate
+continuation a restart and stopped.
+
+**Fix.** The guard is now an item-id identity equality: when a page token was
+supplied, the returned page's first event id must equal that token
+(`_page_first_id`). This validates exactly, needs nothing extra in the cursor, and
+is direction-agnostic. The cursor dropped the now-redundant timestamp field `b`
+(`CURSOR_VERSION` 2 → 3, so old cursors are rejected rather than misread) and
+`encode_cursor`/`decode_cursor` lost the `boundary`/`anchor` parameter. The
+page-restart guard (token pointing back at its own page's first id) and the
+`skip`-based intra-page resume are unchanged.
+
+**Before / after, same live conversation (612 events, real adapter):**
+
+| `limit` | before newest-first | before oldest-first | after (both) |
+| --- | --- | --- | --- |
+| 1 | 4 / 612 | 608 / 612 | 612 / 612 |
+| 2 | 4 / 612 | 608 / 612 | 612 / 612 |
+| 3 | 612 / 612 | 612 / 612 | 612 / 612 |
+| 4 | 4 / 612 | 608 / 612 | 612 / 612 |
+| 5 | 612 / 612 | 612 / 612 | 612 / 612 |
+
+Every post-fix cell is 612 unique entries, zero duplicates, zero missing, and
+terminates on its own. Note `limit=3` was *already* unaffected — the issue's
+"1, 2, 4" list is exactly the limits whose page fill produced a boundary
+inversion on this conversation, confirming the trigger is timestamp inversion
+rather than page size alone.
+
+**Tests.** The suite's fake upstreams now mint real tokens (the next page's first
+item id) instead of arbitrary `"p2"`/`"p3"` strings, so a fixture can no longer
+pass a test the live server would fail. Mutation testing over the ten guard
+protections caught 9; the surviving mutant (removing `skip = 0` after advancing a
+page) was *proven* equivalent by instrumenting that exact point and running both
+the unit suite and the live sweep with no non-zero `skip` observed.

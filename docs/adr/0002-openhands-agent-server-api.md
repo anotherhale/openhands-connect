@@ -109,9 +109,13 @@ and produced **612 unique ids — zero duplicates, zero skips**, matching
 `GET /events/count` exactly. Consecutive pages did not overlap, and each page was
 strictly older than the previous page's last entry.
 
-**`next_page_id` is an opaque token, not an event id.** It is UUID-shaped but is
-not any event id in the page it came from, so the bridge must treat it as opaque
-and must not parse or construct it.
+**`next_page_id` is the id of the next page's first event.** Corrected in Issue
+#14 (this section previously said it was opaque and unrelated to any event id —
+that was an untested assumption). Verified on 1.60.1: requesting `page_id=<token>`
+returns a page whose first item's `id` is byte-identical to the token, across
+`limit ∈ {1,2,3,4,5,7}` × both sort orders (**192/192 pages**). So the token is an
+*inclusive* identity anchor and self-validates: a page whose first id differs from
+the token is not the page that was asked for.
 
 **A bad cursor is silently ignored — the server restarts at page 1.** Probed with
 three inputs: a non-UUID string, a well-formed but nonexistent UUID, and a cursor
@@ -120,7 +124,9 @@ body byte-identical to page 1. There is **no error signal** for an invalid or
 cross-task cursor. A client that blindly reuses a stale or foreign cursor will
 loop over page 1 forever and never detect it. The bridge therefore owns cursor
 validation: it binds each cursor to the task and to the sort direction, and
-refuses a mismatch itself rather than trusting upstream to.
+refuses a mismatch itself rather than trusting upstream to. This is also why the
+first-page-equals-token case must be rejected separately: a restart at page 1 can
+look like a valid page if the token happens to name page 1's own first item.
 
 **A cursor is not bound to the sort order.** Reusing a `TIMESTAMP_DESC` cursor
 with `sort_order=TIMESTAMP` returned `200` and 4 of 5 items overlapping the
@@ -132,24 +138,28 @@ direction per traversal and encodes it in the cursor.
 events (612 distinct values, no ties). Ordering is therefore deterministic on
 `timestamp` alone in practice.
 
-**Ordering is *not* perfectly monotonic within a page.** One page of 100 held an
-event whose timestamp sat between its neighbours' (`…537684` after `…590859` in a
-`TIMESTAMP_DESC` page), and the raw upstream page showed the same inversion — it
-is the server's ordering, not the bridge's rendering. Two consequences, both
-load-bearing:
+**Ordering is *not* monotonic across page boundaries, at any page size.** One
+page of 100 held an event whose timestamp sat between its neighbours'
+(`…537684` after `…590859` in a `TIMESTAMP_DESC` page), and the raw upstream page
+showed the same inversion — it is the server's ordering, not the bridge's
+rendering. At `limit` 1–4 the inversions cross page boundaries often enough that a
+timestamp-directional guard aborts after a couple of pages (4/612 newest-first,
+608/612 oldest-first). Three consequences, all load-bearing:
 
-* The bridge **preserves upstream order** rather than re-sorting. Sorting a page
-  would make its *last* item no longer the item upstream's cursor advances from,
-  so the next page could legitimately start above the sorted minimum and be
-  wrongly rejected as "not advanced".
-* The overlap guard therefore bounds on the page's **last timestamped item**,
-  which is exactly what `next_page_id` advances from — not on the page's min or
-  max. Bounding on an extreme stops a legitimate traversal early and silently
-  hides the rest of the history (covered by
-  `test_out_of_order_event_*_does_not_stop_the_traversal`).
+* The bridge **preserves upstream order** rather than re-sorting, so the returned
+  order matches what a direct `GET` would show.
+* The overlap/repeat guard is **item-id identity**, not a timestamp comparison.
+  Comparing the requested token against the returned page's first id is exact and
+  direction-agnostic. A timestamp guard calls a legitimate continuation a restart
+  whenever the boundary inverts and truncates the traversal — the Issue #14
+  defect. Covered by `test_out_of_order_event_*_does_not_stop_the_traversal` and
+  the live small-limit sweep.
+* Nothing about the boundary needs to travel in the cursor: the token is its own
+  anchor.
 
-A full traversal is still lossless despite the inversion: 7 pages, 612 events,
-612 unique, **zero across-page inversions**.
+A full traversal is lossless at every limit tested: 612 events, 612 unique ids,
+zero duplicates, zero skips, both directions (see
+`docs/INTEGRATION-VALIDATION.md`).
 
 **Keyset alternative also works.** `timestamp__lt=<ts>` with
 `sort_order=TIMESTAMP_DESC` returned exactly the same page as `page_id` and also

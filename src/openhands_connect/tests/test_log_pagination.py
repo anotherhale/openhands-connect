@@ -5,9 +5,16 @@ Every upstream behaviour asserted here was observed on a live Agent Server
 
 * ``sort_order=TIMESTAMP_DESC`` returns the newest event first.
 * ``next_page_id`` pages backward losslessly.
+* ``next_page_id`` **is the id of the next page's first item** (verified 192/192
+  across both directions and limits 1-7), so requesting it returns a page whose
+  first item carries that same id. Fixtures here mint tokens that way; a token
+  unrelated to the returned page is not a shape upstream produces.
 * An invalid or foreign ``page_id`` is **silently ignored** and answers ``200``
   with page 1 — so the bridge must validate cursors itself and must not repeat
   a page it has already returned.
+* Event timestamps are **not monotonic across page boundaries** (a hook event
+  arrives after the state update it caused but carries an earlier timestamp), so
+  page identity is verified by id, never by timestamp ordering.
 """
 
 from __future__ import annotations
@@ -57,16 +64,20 @@ PAGE_3 = [event("e2", "2026-11-27T00:00:02"), event("e1", "2026-11-27T00:00:01")
 
 
 def paged_upstream(requests: list[httpx.Request]) -> Handler:
-    """Serve PAGE_1..3 keyed on the ``page_id`` upstream was given."""
+    """Serve PAGE_1..3, minting each token as the next page's first item id.
+
+    That is what upstream does (verified 192/192), so a handler that mints
+    arbitrary tokens would be testing a contract that does not exist.
+    """
 
     def handler(request: httpx.Request) -> httpx.Response:
         requests.append(request)
         page_id = request.url.params.get("page_id")
         if page_id is None:
-            return page(PAGE_1, "p2")
-        if page_id == "p2":
-            return page(PAGE_2, "p3")
-        if page_id == "p3":
+            return page(PAGE_1, "e4")
+        if page_id == "e4":
+            return page(PAGE_2, "e2")
+        if page_id == "e2":
             return page(PAGE_3, None)
         raise AssertionError(f"unexpected page_id {page_id!r}")
 
@@ -121,7 +132,7 @@ async def test_cursor_pages_backward_without_overlap(environment: Environment) -
         "2026-11-27T00:00:04",
         "2026-11-27T00:00:03",
     ]
-    assert requests[-1].url.params["page_id"] == "p2"
+    assert requests[-1].url.params["page_id"] == "e4"
 
     third = await adapter.get_task_logs(environment, "t1", limit=2, cursor=second.next_cursor)
     assert [entry.timestamp for entry in third.entries] == [
@@ -147,7 +158,7 @@ async def test_cursor_continues_an_oldest_first_traversal(environment: Environme
     def handler(request: httpx.Request) -> httpx.Response:
         requests.append(request)
         if request.url.params.get("page_id") is None:
-            return page(PAGE_3[:2], "p2")
+            return page(PAGE_3[:2], "e1")
         return page(PAGE_3[2:], None)
 
     adapter = adapter_for(handler, environment)
@@ -205,16 +216,16 @@ async def test_cursor_is_opaque_and_not_the_raw_page_id(environment: Environment
 
     first = await adapter.get_task_logs(environment, "t1", limit=2)
     assert first.next_cursor is not None
-    assert "p2" not in first.next_cursor
+    assert "e4" not in first.next_cursor
 
     decoded = json.loads(base64.urlsafe_b64decode(first.next_cursor + "=="))
-    assert decoded["p"] == "p2"
+    assert decoded["p"] == "e4"
     assert decoded["v"] == CURSOR_VERSION
     assert decoded["t"] == "t1"
 
 
 async def test_cursor_carries_no_secret_or_free_text(environment: Environment) -> None:
-    """A cursor crosses the MCP boundary, so it must hold ids and a timestamp only.
+    """A cursor crosses the MCP boundary, so it must hold opaque ids only.
 
     It is base64, not encrypted: anything put in it is readable by the caller.
     """
@@ -224,7 +235,7 @@ async def test_cursor_carries_no_secret_or_free_text(environment: Environment) -
         requests.append(request)
         return page(
             [event("e2", "2026-11-27T00:00:02", text="using secret-token now")],
-            "p2",
+            "e1",
         )
 
     logs = await adapter_for(handler, environment).get_task_logs(environment, "t1", limit=1)
@@ -233,7 +244,7 @@ async def test_cursor_carries_no_secret_or_free_text(environment: Environment) -
     raw = base64.urlsafe_b64decode(logs.next_cursor + "=" * (-len(logs.next_cursor) % 4))
     payload = json.loads(raw)
 
-    assert set(payload) == {"v", "t", "e", "o", "p", "b"}
+    assert set(payload) == {"v", "t", "e", "o", "p"}
     assert "secret-token" not in logs.next_cursor
     assert "using" not in logs.next_cursor
 
@@ -257,7 +268,7 @@ async def test_out_of_order_event_does_not_stop_the_traversal(environment: Envir
                     event("e3", "2026-11-27T18:00:01"),
                     event("e2", "2026-11-27T18:00:03"),
                 ],
-                "p2",
+                "e1",
             )
         return page([event("e1", "2026-11-27T18:00:02")], None)
 
@@ -293,7 +304,7 @@ async def test_out_of_order_event_in_an_oldest_first_page_does_not_stop_it(
                     event("e2", "2026-11-27T18:00:05"),
                     event("e3", "2026-11-27T18:00:03"),
                 ],
-                "p2",
+                "e4",
             )
         return page([event("e4", "2026-11-27T18:00:04")], None)
 
@@ -338,7 +349,7 @@ async def test_unrenderable_page_does_not_claim_more_history(environment: Enviro
                     "llm_message": {"role": "assistant"},
                 },
             ],
-            "p2",
+            "u1",
         )
 
     logs = await adapter_for(handler, environment).get_task_logs(environment, "t1", limit=3)
@@ -351,18 +362,22 @@ async def test_unrenderable_page_does_not_claim_more_history(environment: Enviro
 async def test_stale_cursor_does_not_repeat_a_page(environment: Environment) -> None:
     """Upstream silently restarts at page 1 for a stale cursor.
 
-    If it did, a naive client would return the same entries forever. The bridge
-    carries the previous page's boundary in the cursor and stops when a page has
-    not advanced past it.
+    Left unchecked a naive client would return the same entries forever. The
+    bridge validates each continuation by item id: the token names the page it
+    leads to, so a restarted page whose first id differs from the token is
+    rejected.
     """
     calls: list[str | None] = []
 
     def handler(request: httpx.Request) -> httpx.Response:
         page_id = request.url.params.get("page_id")
         calls.append(page_id)
-        # Both the first page and the "next" page return PAGE_1: upstream
-        # ignored the cursor and restarted, which it does for a stale token.
-        return page(PAGE_1, "p2")
+        if page_id is None:
+            # A good first page, whose token points at the next page's first item.
+            return page(PAGE_1, "e4")
+        # Upstream ignored the now-stale token and restarted at page 1, whose
+        # first item ("e6") is not the "e4" the cursor asked for.
+        return page(PAGE_1, "e4")
 
     adapter = adapter_for(handler, environment)
     first = await adapter.get_task_logs(environment, "t1", limit=2)
@@ -381,11 +396,11 @@ async def test_upstream_requests_are_bounded(environment: Environment) -> None:
 
     def handler(request: httpx.Request) -> httpx.Response:
         calls.append(request.url.params.get("page_id"))
-        # Each page is strictly older than the last, so the stale-page guard
-        # never fires and only the page cap can end the loop. One entry per page
-        # also keeps ``limit`` from being reached.
+        # Endless pages, each naming the next page's first item so every
+        # continuation is honoured and only the page cap can end the loop. One
+        # entry per page also keeps ``limit`` from being reached.
         index = len(calls)
-        return page([event(f"e{index}", f"2026-11-27T00:00:{60 - index:02d}")], "always-more")
+        return page([event(f"e{index}", f"2026-11-27T00:00:{60 - index:02d}")], f"e{index + 1}")
 
     logs = await adapter_for(handler, environment).get_task_logs(environment, "t1", limit=5)
 
@@ -404,15 +419,15 @@ async def test_page_cap_stops_the_loop(environment: Environment) -> None:
     def handler(request: httpx.Request) -> httpx.Response:
         calls.append(request.url.params.get("page_id"))
         index = len(calls)
-        # Events that summarize to nothing, but with advancing timestamps so the
-        # stale-page guard passes and only the cap can stop the loop.
+        # Events that summarize to nothing, each page naming the next page's first
+        # item so only the page cap can stop the loop.
         empty: dict[str, object] = {
             "id": f"x{index}",
             "timestamp": f"2026-11-27T00:00:{60 - index:02d}",
             "kind": "MessageEvent",
             "llm_message": {"role": "assistant"},
         }
-        return page([empty], "always-more")
+        return page([empty], f"x{index + 1}")
 
     logs = await adapter_for(handler, environment).get_task_logs(environment, "t1", limit=5)
 
@@ -455,13 +470,13 @@ def sparse_then_full_upstream(calls: list[str | None]) -> Handler:
         page_id = request.url.params.get("page_id")
         calls.append(page_id)
         if page_id is None:
-            return page([event("e5", "2026-11-27T00:00:05")], "p2")
-        if page_id == "p2":
+            return page([event("e5", "2026-11-27T00:00:05")], "e4")
+        if page_id == "e4":
             return page(
                 [event("e4", "2026-11-27T00:00:04"), event("e3", "2026-11-27T00:00:03")],
-                "p3",
+                "e2",
             )
-        if page_id == "p3":
+        if page_id == "e2":
             return page([event("e2", "2026-11-27T00:00:02")], None)
         raise AssertionError(f"unexpected page_id {page_id!r}")
 
@@ -482,18 +497,18 @@ async def test_remainder_on_a_later_page_is_also_preserved(
         if page_id is None:
             return page(
                 [event("e7", "2026-11-27T00:00:07"), event("e6", "2026-11-27T00:00:06")],
-                "p2",
+                "e5",
             )
-        if page_id == "p2":
+        if page_id == "e5":
             return page(
                 [
                     event("e5", "2026-11-27T00:00:05"),
                     event("e4", "2026-11-27T00:00:04"),
                     event("e3", "2026-11-27T00:00:03"),
                 ],
-                "p3",
+                "e2",
             )
-        if page_id == "p3":
+        if page_id == "e2":
             return page([event("e2", "2026-11-27T00:00:02")], None)
         raise AssertionError(f"unexpected page_id {page_id!r}")
 
@@ -558,7 +573,7 @@ async def test_partial_page_remainder_is_returned_on_continuation(
         "2026-11-27T00:00:02",
     ]
     # It resumed by re-reading page 2 rather than jumping past it to page 3.
-    assert calls.count("p2") == 2
+    assert calls.count("e4") == 2
     assert second.has_more is False
     assert second.next_cursor is None
 
@@ -605,8 +620,8 @@ async def test_one_page_spanning_several_responses_keeps_every_entry(
         page_id = request.url.params.get("page_id")
         calls.append(page_id)
         if page_id is None:
-            return page([event("e1", "2026-11-27T00:00:09")], "p2")
-        if page_id == "p2":
+            return page([event("e1", "2026-11-27T00:00:09")], "e2")
+        if page_id == "e2":
             # Five renderable entries on one upstream page, drained at limit=2.
             return page(
                 [
@@ -654,13 +669,13 @@ async def test_partial_page_remainder_is_kept_in_oldest_first(
         page_id = request.url.params.get("page_id")
         calls.append(page_id)
         if page_id is None:
-            return page([event("e1", "2026-11-27T00:00:01")], "p2")
-        if page_id == "p2":
+            return page([event("e1", "2026-11-27T00:00:01")], "e2")
+        if page_id == "e2":
             return page(
                 [event("e2", "2026-11-27T00:00:02"), event("e3", "2026-11-27T00:00:03")],
-                "p3",
+                "e4",
             )
-        if page_id == "p3":
+        if page_id == "e4":
             return page([event("e4", "2026-11-27T00:00:04")], None)
         raise AssertionError(f"unexpected page_id {page_id!r}")
 
@@ -710,15 +725,15 @@ async def test_resume_rejects_a_page_that_is_not_the_expected_one(
 
     def restarting(request: httpx.Request) -> httpx.Response:
         calls.append(request.url.params.get("page_id"))
-        # Upstream ignored the token and restarted at page 1, whose last item
-        # does not match the one the cursor was issued for.
-        return page(PAGE_1, "p2")
+        # Upstream ignored the token and restarted at page 1, whose first item
+        # is not the one the cursor's token names.
+        return page(PAGE_1, "e6")
 
     second = await adapter_for(restarting, environment).get_task_logs(
         environment, "t1", limit=2, cursor=first.next_cursor
     )
 
-    assert calls == ["p2"]
+    assert calls == ["e4"]
     assert second.entries == ()
     assert second.has_more is False
     assert second.next_cursor is None
@@ -729,28 +744,27 @@ async def test_resume_rejects_an_offset_past_the_end_of_the_page(
 ) -> None:
     """An offset beyond the returned page means the offset is untrustworthy.
 
-    Identity alone cannot catch this: a page can shrink while keeping the same
-    last item. Slicing past the end would yield nothing from this page yet let
-    the call move on to the next one, so the traversal would silently skip
-    whatever the offset referred to. It must stop instead.
+    Identity alone cannot catch this: the page still starts with the id the token
+    names, but a page can shrink between calls. Slicing past the end would yield
+    nothing from this page yet let the call move on to the next one, so the
+    traversal would silently skip whatever the offset referred to. It must stop.
     """
     calls: list[str | None] = []
 
     def handler(request: httpx.Request) -> httpx.Response:
         page_id = request.url.params.get("page_id")
         calls.append(page_id)
-        if page_id == "p2":
-            # Boundary matches the cursor, but only one entry where the cursor
+        if page_id == "e5":
+            # Identity matches the cursor, but only one entry where the cursor
             # says three were already consumed.
-            return page([event("e5", "2026-11-27T00:00:05")], "p3")
+            return page([event("e5", "2026-11-27T00:00:05")], "e4")
         return page([event("e4", "2026-11-27T00:00:04")], None)
 
     forged = encode_cursor(
         task_id="t1",
         environment_id="local",
         sort_order=LogSortOrder.NEWEST_FIRST,
-        upstream_page_id="p2",
-        boundary="2026-11-27T00:00:05",
+        upstream_page_id="e5",
         skip=3,
     )
 
@@ -760,8 +774,8 @@ async def test_resume_rejects_an_offset_past_the_end_of_the_page(
 
     assert logs.entries == ()
     assert logs.has_more is False
-    # It stopped rather than moving on to p3 and skipping past the offset.
-    assert calls == ["p2"]
+    # It stopped rather than moving on to e4 and skipping past the offset.
+    assert calls == ["e5"]
 
 
 async def test_cursor_resume_offset_is_bounded_and_not_free_text(
@@ -777,7 +791,7 @@ async def test_cursor_resume_offset_is_bounded_and_not_free_text(
     raw = base64.urlsafe_b64decode(first.next_cursor + "=" * (-len(first.next_cursor) % 4))
     payload = json.loads(raw)
 
-    assert set(payload) == {"v", "t", "e", "o", "p", "b", "s"}
+    assert set(payload) == {"v", "t", "e", "o", "p", "s"}
     assert payload["s"] == 1
     assert isinstance(payload["s"], int) and not isinstance(payload["s"], bool)
 
@@ -802,6 +816,63 @@ async def test_cursor_with_a_nonsensical_resume_offset_is_rejected(
     )
 
     with pytest.raises(InvalidInputError):
+        await adapter_for(sparse_then_full_upstream([]), environment).get_task_logs(
+            environment, "t1", cursor=forged
+        )
+
+
+@pytest.mark.parametrize("bad_version", [0, 1, 2, 4, 99, "3", None, True])
+async def test_cursor_from_an_unknown_version_is_rejected(
+    environment: Environment, bad_version: object
+) -> None:
+    """A cursor from a different payload shape must be refused, not misread.
+
+    The page token and resume offset mean different things in each version, so
+    reading an old cursor under the current rules is exactly how entries get
+    dropped or repeated. Any version other than the current one is an error.
+    """
+    forged_payload = {
+        "v": bad_version,
+        "t": "t1",
+        "e": "local",
+        "o": "newest_first",
+        "p": "e4",
+    }
+    forged = (
+        base64.urlsafe_b64encode(json.dumps(forged_payload, separators=(",", ":")).encode())
+        .decode()
+        .rstrip("=")
+    )
+
+    with pytest.raises(InvalidInputError, match="version"):
+        await adapter_for(sparse_then_full_upstream([]), environment).get_task_logs(
+            environment, "t1", cursor=forged
+        )
+
+
+async def test_version_2_cursor_with_a_boundary_is_still_rejected(
+    environment: Environment,
+) -> None:
+    """The concrete upgrade hazard: a real v2 cursor must not be honoured.
+
+    Version 2 cursors carry ``b``, a timestamp boundary the adapter no longer
+    uses. Accepting one would resume from a position whose meaning has changed.
+    """
+    v2_payload = {
+        "v": 2,
+        "t": "t1",
+        "e": "local",
+        "o": "newest_first",
+        "p": "e4",
+        "b": "2026-11-27T00:00:05",
+    }
+    forged = (
+        base64.urlsafe_b64encode(json.dumps(v2_payload, separators=(",", ":")).encode())
+        .decode()
+        .rstrip("=")
+    )
+
+    with pytest.raises(InvalidInputError, match="version"):
         await adapter_for(sparse_then_full_upstream([]), environment).get_task_logs(
             environment, "t1", cursor=forged
         )
