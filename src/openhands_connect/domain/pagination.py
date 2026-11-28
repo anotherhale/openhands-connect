@@ -28,8 +28,11 @@ from openhands_connect.domain.models import LogSortOrder
 #: Bumped when the payload shape changes; an older cursor then fails validation
 #: instead of being misread under the new shape. Version 2 added ``s``: a cursor
 #: from before that must not be read as "offset 0" by a bridge that knows better,
-#: because that is exactly the entry-dropping bug it fixes.
-CURSOR_VERSION = 2
+#: because that is exactly the entry-dropping bug it fixes. Version 3 dropped
+#: ``b`` (a timestamp boundary) because timestamps are not monotonic across pages
+#: and the timestamp guard truncated traversals; the page token is now its own
+#: anchor, so a cursor from version 2 or earlier must not be read under it.
+CURSOR_VERSION = 3
 
 #: A real cursor is a small base64 blob. Bounding the length keeps a caller from
 #: forcing large decode work on every page.
@@ -42,16 +45,23 @@ def encode_cursor(
     environment_id: str,
     sort_order: LogSortOrder,
     upstream_page_id: str,
-    boundary: str | None = None,
     skip: int = 0,
 ) -> str:
     """Wrap an upstream ``next_page_id`` in a bridge cursor.
 
-    ``boundary`` is the timestamp of the last item on the page just returned; the
-    next page must begin strictly past it in the traversal's direction. It
-    travels in the cursor because upstream will happily answer a stale
-    ``page_id`` with page 1 and ``200``; without the boundary the bridge cannot
-    tell "next page" from "silently restarted at page 1".
+    Upstream's page token is itself the id of the next page's first item
+    (verified on Agent Server 1.60.1, both sort directions), so requesting it
+    returns a page whose first item carries that same id. The adapter validates
+    that equality, which is what detects upstream silently restarting at page 1
+    for a stale or foreign token. Nothing extra needs to travel in the cursor:
+    the token is its own anchor.
+
+    Verifying by *id* rather than by timestamp is the point. A timestamp boundary
+    cannot order this history: upstream emits events whose timestamps are not
+    monotonic even across page boundaries (a hook event arrives after the state
+    update it caused but carries an earlier timestamp), so a directional
+    timestamp guard stops a legitimate traversal early. Ids are a stable,
+    server-minted identity.
 
     ``skip`` is how many renderable entries at the *start* of the page named by
     ``upstream_page_id`` were already returned to the caller. A single response
@@ -66,8 +76,6 @@ def encode_cursor(
         "o": sort_order.value,
         "p": upstream_page_id,
     }
-    if boundary is not None:
-        payload["b"] = boundary
     if skip:
         payload["s"] = skip
     raw = json.dumps(payload, separators=(",", ":"), sort_keys=True).encode()
@@ -76,8 +84,8 @@ def encode_cursor(
 
 def decode_cursor(
     cursor: str, *, task_id: str, environment_id: str
-) -> tuple[LogSortOrder, str, str | None, int]:
-    """Validate a cursor and return its direction, page id, bound, and skip.
+) -> tuple[LogSortOrder, str, int]:
+    """Validate a cursor and return its direction, page token, and skip.
 
     Rejects, as ``InvalidInputError``: an empty or over-long cursor, one that is
     not a well-formed envelope, one issued for a different task or environment,
@@ -132,17 +140,13 @@ def decode_cursor(
     if not isinstance(page_id, str) or not page_id:
         raise InvalidInputError("cursor has no usable page token")
 
-    boundary = payload.get("b")
-    if boundary is not None and not isinstance(boundary, str):
-        raise InvalidInputError("cursor has an invalid boundary")
-
     skip = payload.get("s", 0)
     # ``bool`` is an ``int`` subclass, so exclude it explicitly: True would
     # otherwise be accepted as a skip of 1.
     if not isinstance(skip, int) or isinstance(skip, bool) or skip < 0:
         raise InvalidInputError("cursor has an invalid resume position")
 
-    return order, page_id, boundary, skip
+    return order, page_id, skip
 
 
 __all__ = ["CURSOR_VERSION", "MAX_CURSOR_CHARS", "decode_cursor", "encode_cursor"]

@@ -377,19 +377,20 @@ class OpenHandsAdapter:
         A page is bounded twice: ``limit`` entries and at most
         ``MAX_LOG_PAGES_PER_CALL`` upstream requests. Upstream can answer a bad
         ``page_id`` with page 1 and ``200`` instead of an error, so the bridge
-        validates the cursor itself and additionally refuses to return a page
-        that overlaps the previous one, rather than silently duplicating entries
-        or looping.
+        validates the cursor itself and additionally requires each continuation to
+        come back as the page it asked for, rather than silently duplicating
+        entries or looping. That check compares item ids, not timestamps:
+        upstream's timestamps are not monotonic across page boundaries, so a
+        directional timestamp guard truncates legitimate traversals.
         """
         bounded = max(1, min(limit, MAX_LOG_ENTRIES))
 
         if cursor is None:
             order = sort_order or LogSortOrder.NEWEST_FIRST
             upstream_page_id: str | None = None
-            boundary: str | None = None
             skip = 0
         else:
-            order, upstream_page_id, boundary, skip = decode_cursor(
+            order, upstream_page_id, skip = decode_cursor(
                 cursor, task_id=task_id, environment_id=environment.id
             )
             # An omitted sort_order takes the cursor's direction, so a caller can
@@ -406,10 +407,6 @@ class OpenHandsAdapter:
         collected: list[TaskLogEntry] = []
         pages_fetched = 0
         page_id = upstream_page_id
-        #: True while the page about to be fetched must be entered partway
-        #: through, because the previous call already returned its first
-        #: ``skip`` renderable entries.
-        is_resume = skip > 0
         #: Renderable entries the caller still has room for.
         room = bounded
         #: Entries this response could not hand back. Zero unless upstream
@@ -451,47 +448,42 @@ class OpenHandsAdapter:
                     if entry is not None
                 ]
 
-                if is_resume:
-                    # Resuming into a page the previous call already returned a
-                    # prefix of, so this page legitimately begins at or before the
-                    # boundary. What must hold is that it is the *same* page:
-                    # upstream answers a stale page_id with page 1, which would
-                    # otherwise hand back entries the caller already has.
-                    #
-                    # Identity is the page's *last* item, not its first. Upstream
-                    # ordering is not perfectly monotonic within a page, so the
-                    # first item of a resumed page can appear newer than the
-                    # boundary and a directional comparison would reject a
-                    # legitimate resume and silently hide the remainder.
-                    resumed_boundary = _page_boundary(raw_items)
-                    if boundary is None or resumed_boundary != boundary or skip > len(page_entries):
+                # When a page token was supplied, confirm upstream returned that
+                # page. Upstream answers a stale or foreign ``page_id`` with page 1
+                # and ``200``, so without this check a restart would silently hand
+                # back entries the caller already has.
+                #
+                # The comparison is an id equality, not a timestamp ordering.
+                # Upstream's ``page_id`` is itself the id of that page's first item
+                # (verified on 1.60.1, both directions), so the token validates
+                # itself exactly. Ordering by timestamp cannot work: upstream emits
+                # events whose timestamps are not monotonic across page boundaries,
+                # so a directional guard calls a legitimate continuation a restart
+                # and truncates the traversal - the defect this replaces.
+                if page_id is not None and _page_first_id(raw_items) != page_id:
+                    logger.warning(
+                        "log pagination for task %s did not return the page it "
+                        "asked for; stopping instead of repeating entries",
+                        task_id,
+                    )
+                    page_id = None
+                    break
+
+                if skip:
+                    # Resuming inside the page just validated. The id check proved
+                    # it is the same page, so the offset addresses the same
+                    # entries the previous call left off before.
+                    if skip > len(page_entries):
                         logger.warning(
-                            "log pagination for task %s could not resume inside the "
-                            "expected page; stopping instead of repeating entries",
+                            "log pagination for task %s has a resume offset past the "
+                            "end of the page; stopping instead of skipping blindly",
                             task_id,
                         )
                         page_id = None
                         break
                     entered = skip
                     page_entries = page_entries[skip:]
-                    is_resume = False
-
-                elif boundary is not None:
-                    first_ts = _page_start(raw_items)
-                    # Upstream answers a stale or foreign page_id with page 1 and
-                    # 200. A page that is not strictly past the boundary means we
-                    # did not move, so stop rather than repeat entries forever.
-                    if first_ts is not None and _not_older(first_ts, boundary, order):
-                        logger.warning(
-                            "log pagination for task %s did not advance past %s; "
-                            "stopping instead of repeating entries",
-                            task_id,
-                            boundary,
-                        )
-                        page_id = None
-                        break
-                    entered = 0
-
+                    skip = 0
                 else:
                     entered = 0
 
@@ -510,32 +502,36 @@ class OpenHandsAdapter:
                     # to discard the tail of a page permanently. ``entered`` keeps
                     # the offset cumulative across repeated resumes of one page.
                     if page_id is None:
-                        # Unreachable while upstream honours ``limit`` (page one
-                        # cannot exceed it), but if it ever over-returns there is
-                        # no token to resume inside the page. Count the drop
-                        # rather than lose it silently.
+                        # Page one cannot exceed ``limit`` while upstream honours
+                        # its own contract, and there is no token to page one's
+                        # first item to resume from, so count the drop rather than
+                        # lose it silently.
                         dropped = len(remaining)
                         break
                     skip = entered + len(taken)
-                    # The cursor's boundary now names the page being resumed into,
-                    # not the one before it, so the next call can confirm it got
-                    # the same page back before trusting ``skip``.
-                    boundary = _page_boundary(raw_items)
                     break
 
                 if not has_next:
                     page_id = None
                     break
 
-                # The next page must begin strictly past this page's last item.
-                # Without a boundary the following page could not be checked for
-                # a silent restart, so stop rather than risk repeating entries.
-                new_boundary = _page_boundary(raw_items)
-                if new_boundary is None:
+                # The token is the id of the next page's first item, so it also
+                # self-validates: a page whose first id differs is a restart.
+                current_start = _page_first_id(raw_items)
+                if next_page_id == current_start:
+                    # The token points back at this page's own first item, so
+                    # upstream did not advance. Following it would return the same
+                    # entries forever; the id check above cannot catch this because
+                    # the page really is the one the token names.
+                    logger.warning(
+                        "log pagination for task %s did not advance past page %s; "
+                        "stopping instead of repeating entries",
+                        task_id,
+                        current_start,
+                    )
                     page_id = None
                     break
-
-                page_id, boundary = next_page_id, new_boundary
+                page_id = next_page_id
                 skip = 0
                 if room == 0:
                     break
@@ -550,7 +546,6 @@ class OpenHandsAdapter:
                 environment_id=environment.id,
                 sort_order=order,
                 upstream_page_id=page_id,
-                boundary=boundary,
                 skip=skip,
             )
             if page_id is not None
@@ -1026,44 +1021,18 @@ def _timestamp(value: object) -> datetime | None:
         return None
 
 
-def _not_older(candidate: str, boundary: str, order: LogSortOrder) -> bool:
-    """True when ``candidate`` has not moved past ``boundary`` in ``order``.
+def _page_first_id(raw_items: list[Any]) -> str | None:
+    """The upstream id of the page's first item, or ``None``.
 
-    Timestamps arrive as fixed-width ISO-8601 with a microsecond fraction, so a
-    lexicographic comparison is chronological here. Newest-first means each page
-    must be strictly *older* than the last; oldest-first means strictly *newer*.
-    """
-    if order is LogSortOrder.NEWEST_FIRST:
-        return candidate >= boundary
-    return candidate <= boundary
-
-
-def _page_start(raw_items: list[Any]) -> str | None:
-    """The timestamp of the page's first timestamped item, or ``None``.
-
-    Read from the raw page rather than the rendered entries so that an event the
-    bridge cannot render cannot hide a restart: the overlap guard must compare
-    the same kind of item ``_page_boundary`` produced.
+    Upstream's ``next_page_id`` is the id of the next page's first item, so this
+    is the identity a continuation is pinned to. Read from the raw page rather
+    than the rendered entries so an event the bridge cannot render cannot hide a
+    restart; ids, unlike timestamps, are a stable server-minted identity and are
+    not affected by upstream's non-monotonic event timestamps.
     """
     for item in raw_items:
-        if isinstance(item, dict) and isinstance(ts := item.get("timestamp"), str):
-            return ts
-    return None
-
-
-def _page_boundary(raw_items: list[Any]) -> str | None:
-    """The timestamp of the page's last timestamped item, or ``None``.
-
-    That item is what the upstream ``next_page_id`` advances from, so the next
-    page must begin strictly past it in the traversal's direction. Using an
-    extreme (``min``/``max``) instead is wrong: upstream ordering is not
-    perfectly monotonic — a page can hold an event whose timestamp sits between
-    its neighbours' (observed on 1.60.1) — and an extreme would then reject a
-    legitimate next page.
-    """
-    for item in reversed(raw_items):
-        if isinstance(item, dict) and isinstance(ts := item.get("timestamp"), str):
-            return ts
+        if isinstance(item, dict) and isinstance(item_id := item.get("id"), str) and item_id:
+            return item_id
     return None
 
 
